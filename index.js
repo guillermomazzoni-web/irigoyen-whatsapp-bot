@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const qrcode = require('qrcode');
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -89,7 +89,7 @@ async function consultarGemini(remitenteId, mensajeTexto) {
 
         historial.push({ role: 'user', parts: [{ text: mensajeTexto }] });
 
-        const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=' + GEMINI_API_KEY;
+        const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + GEMINI_API_KEY;
         const payload = JSON.stringify({
             contents: historial,
             generationConfig: {
