@@ -1,0 +1,18 @@
+{
+  "name": "estudio-irigoyen-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "WhatsApp Web Bridge con Inteligencia Artificial Gemini para Estudio Jurídico Jaime Irigoyen",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "express": "^4.19.2",
+    "pino": "^9.0.0",
+    "qrcode": "^1.5.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
