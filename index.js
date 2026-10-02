@@ -1,11 +1,6 @@
-/**
- * WhatsApp Bridge con Baileys + Google Gemini AI
- * Estudio Jurídico Jaime Irigoyen
- */
-
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const express = require('express');
-const QRCode = require('qrcode');
+const qercode = require('qrcode');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const https = require('https');
 
@@ -17,56 +12,34 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 let currentQR = null;
 let isConnected = false;
 let userHistories = new Map();
+let globalAdminRules = [];
 
-// Servidor Web para ver el Código QR
-app.get('/', (req, res) => {
+// Servir el Código QR en una página web
+app.get('/', (rq, res) => {
     if (isConnected) {
-        return res.send(`
+        res.send(`
             <!DOCTYPE html>
-            <html lang="es">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>WhatsApp Bot Activo · Estudio Jaime Irigoyen</title>
-                <style>
-                    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #0f172a; color: #fff; margin: 0; }
-                    .card { background: #1e293b; padding: 40px; border-radius: 20px; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.5); max-width: 450px; width: 90%; }
-                    .status { display: inline-flex; align-items: center; gap: 8px; background: #064e3b; color: #34d399; padding: 8px 16px; border-radius: 50px; font-weight: 600; font-size: 0.9rem; margin-bottom: 20px; }
-                    .dot { width: 10px; height: 10px; background: #34d399; border-radius: 50%; box-shadow: 0 0 10px #34d399; }
-                    h1 { font-size: 1.5rem; margin: 0 0 10px; color: #f8fafc; }
-                    p { color: #94a3b8; font-size: 0.95rem; line-height: 1.5; margin: 0; }
-                </style>
-            </head>
-            <body>
-                <div class="card">
-                    <div class="status"><span class="dot"></span> EN LÍNEA Y CONECTADO</div>
-                    <h1>WhatsApp Bot Activo</h1>
-                    <p>El bot del <strong>Estudio Jurídico Jaime Irigoyen</strong> está conectado a tu WhatsApp Business y respondiendo consultas con Inteligencia Artificial.</p>
-                </div>
+            <html>
+            <head><title>Bot Activo</title></head>
+            <body style="background:#0f172a;color:#22c25e;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;">
+                <h1>✅ Conectado y En Línea</h1>
             </body>
             </html>
         `);
-    }
-
-    if (currentQR) {
-        QRCode.toDataURL(currentQR, (err, url) => {
-            if (err) return res.send("Error generando QR.");
+    } else if (currentQR) {
+        qrcode.toDataURL(currentQR, (err, url) => {
+            if (err) return res.send('Error al generar QR');
             res.send(`
                 <!DOCTYPE html>
-                <html lang="es">
+                <html>
                 <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Vincular WhatsApp · Estudio Jaime Irigoyen</title>
-                    <meta http-equiv="refresh" content="5">
+                    <meta http-equiv="refresh" content="10">
+                    <title>Vincular W`htsApp</title>
                     <style>
-                        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #0f172a; color: #fff; margin: 0; }
-                        .card { background: #1e293b; padding: 35px 25px; border-radius: 20px; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.5); max-width: 440px; width: 90%; }
-                        h1 { font-size: 1.4rem; margin: 0 0 10px; color: #f8fafc; }
-                        p { color: #94a3b8; font-size: 0.9rem; line-height: 1.5; margin: 0 0 20px; }
-                        .qr-box { background: #fff; padding: 15px; border-radius: 14px; display: inline-block; margin-bottom: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.2); }
-                        .qr-box img { display: block; max-width: 250px; width: 100%; height: auto; }
-                        .instructions { background: #0f172a; padding: 15px; border-radius: 12px; text-align: left; font-size: 0.85rem; color: #cbd5e1; }
+                        body { background: #0f172a; color: #f8fafc; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+                        .card { background: #1e292b; padding: 40px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); text-align: center; max-width: 400px; }
+                        .qr-box { background: #fff; padding: 20px; border-radius: 8px; margin: 20px 0; display: inline-block; }
+                        .instructions { background: #0f172a; padding: 20px; border-radius: 8px; text-align: left; font-size: 14px; }
                         .instructions ol { margin: 0; padding-left: 20px; }
                         .instructions li { margin-bottom: 6px; }
                     </style>
@@ -110,13 +83,15 @@ async function consultarGemini(remitenteId, mensajeTexto) {
         let historial = userHistories.get(remitenteId) || [];
 
         if (historial.length === 0) {
-            const instrucciones = "Hola. Sos el asistente virtual oficial del Estudio Jurídico Jaime Irigoyen, especializado en derecho societario argentino (SAS, SRL, SA, Asociaciones Civiles, ONGs).\n" +
+            const adminRulesText = globalAdminRules.length > 0 ? "\nReglas adicionales del administrador:\n" + globalAdminRules.join("\n") : "";
+            const instrucciones = "Sos el asistente virtual oficial del Estudio Juridico Jaime Irigoyen, especializado en derecho societario argentino.\n" +
                 "REGLAS OBLIGATORIAS:\n" +
-                "1. NUNCA des asesoramiento legal específico ni redactes contratos.\n" +
-                "2. Si preguntan precios exactos o trámites complejos, decí amablemente: 'Esa es una excelente consulta. Un abogado del Estudio se comunicará a la brevedad con vos para asesorarte en detalle. ¿Me podrías confirmar tu nombre y correo electrónico?'\n" +
-                "3. Sé conciso, profesional y cálido (máximo 2 a 3 oraciones breves). Estás respondiendo por WhatsApp.\n" +
-                "4. Servicios: Constitución, mantenimiento societario (balances, asambleas ordinarias/extraordinarias, cambio de autoridades/gerencias) y procesos de disolución/cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.\n" +
-                "A partir de ahora, respondé respetando estas reglas.";
+                "1. Tono ESTRICTAMENTE FORMAL y PROFESIONAL en todo momento. Somos un estudio juridico.\n" +
+                "2. Pide SIEMPRE el nombre y apellido en el primer contacto. Una vez que te lo den, dirigete SIEMPRE a la persona como 'Sr.', 'Sra.' o 'Srta.' seguido de su apellido. No uses trato informal.\n" +
+                "3. Usa la frase 'Esa es una excelente consulta' COMO MAXIMO UNA SOLA VEZ en la conversacion, y SOLO si la pregunta es sobre derecho societario.\n" +
+                "4. NUNCA des asesoramiento legal especifico ni redactes contratos.\n" +
+                "5. Si preguntan precios o tramites, responde que un abogado del Estudio se comunicara a la brevedad.\n" +
+                "6. Se conciso (maximo 2 a 3 oraciones breves). Estas en WhatsApp." + adminRulesText;
 
             historial.push({ role: "user", parts: [{ text: instrucciones }] });
             historial.push({ role: "model", parts: [{ text: "Entendido. Actuaré como el asistente virtual del Estudio Jaime Irigoyen siguiendo estrictamente estas reglas." }] });
@@ -151,7 +126,7 @@ async function consultarGemini(remitenteId, mensajeTexto) {
                         if (reply) {
                             historial.push({ role: "model", parts: [{ text: reply }] });
                             if (historial.length > 12) {
-                                historial = [...historial.slice(0, 2), ...historial.slice(-10)];
+                                historial = [...historial.slice(0, 2), ..-historial.slice(-10)];
                             }
                             userHistories.set(remitenteId, historial);
                             return resolve(reply);
@@ -166,7 +141,7 @@ async function consultarGemini(remitenteId, mensajeTexto) {
 
         req.on('error', (err) => {
             console.error('Error en llamada a Gemini:', err);
-            resolve("Disculpá, en este momento estoy teniendo un inconveniente técnico. Un abogado del estudio se comunicará con vos a la brevedad.");
+            resolve("Disculpá, en este momento estoy teniendo un inconveniente técnico. Un abogado del estudio se comunicaqá con vos a la brevedad.");
         });
 
         req.write(payload);
@@ -195,7 +170,7 @@ async function connectToWhatsApp() {
 
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Conexi�n cerrada. Error:', lastDisconnect?.error); console.log('Reconectando:', shouldReconnect);
+            console.log('Conexión cerrada. Error:', lastDisconnect?.error); console.log('Reconectando:', shouldReconnect);
             isConnected = false;
             currentQR = null;
             if (shouldReconnect) {
@@ -226,6 +201,15 @@ async function connectToWhatsApp() {
             if (!text.trim()) continue;
 
             console.log(`Mensaje entrante de ${sender}: ${text}`);
+
+            // MODO ADMINISTRADOR
+            if (text.startsWith("ADMINCHIQUI ", "")) {
+                const nuevaRegla = text.replace("ADMINCHIQUI ", "").trim();
+                globalAdminRules.push(nuevaRegla);
+                await sock.sendMessage(sender, { text: "₥ Regla guardada:\n" + nuevaRegla )});
+                console.log("[ADMIN] Nueva regla:", nuevaRegla);
+                continue;
+            }
 
             // Enviar indicador de que el bot está escribiendo
             await sock.sendPresenceUpdate('composing', sender);
