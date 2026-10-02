@@ -195,11 +195,11 @@ async function connectToWhatsApp() {
 
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Conexión cerrada. Reconectando:', shouldReconnect);
+            console.log('Conexi�n cerrada. Error:', lastDisconnect?.error); console.log('Reconectando:', shouldReconnect);
             isConnected = false;
             currentQR = null;
             if (shouldReconnect) {
-                connectToWhatsApp();
+                setTimeout(connectToWhatsApp, 5000);
             }
         } else if (connection === 'open') {
             console.log('¡Conexión establecida con WhatsApp exitosamente!');
@@ -245,5 +245,5 @@ async function connectToWhatsApp() {
 
 app.listen(PORT, () => {
     console.log(`Servidor web activo en el puerto ${PORT}`);
-    connectToWhatsApp();
+    setTimeout(connectToWhatsApp, 5000);
 });
