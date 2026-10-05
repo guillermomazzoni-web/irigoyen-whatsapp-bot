@@ -221,3 +221,4 @@ app.listen(PORT, () => {
     console.log('Servidor web activo en el puerto ' + PORT);
     setTimeout(connectToWhatsApp, 5000);
 });
+
