@@ -1,6 +1,6 @@
 ﻿/**
  * WhatsApp Bridge con Baileys + Google Gemini AI
- * Estudio Jurídico Jaime Irigoyen - FASE 1
+ * Estudio JurÃ­dico Jaime Irigoyen
  */
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
@@ -17,9 +17,8 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 let currentQR = null;
 let isConnected = false;
 let userHistories = new Map();
-let globalAdminRules = []; // Memoria para las reglas del Modo Administrador
 
-// Servidor Web para ver el Código QR
+// Servidor Web para ver el CÃ³digo QR
 app.get('/', (req, res) => {
     if (isConnected) {
         return res.send(`
@@ -28,7 +27,7 @@ app.get('/', (req, res) => {
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>WhatsApp Bot Activo · Estudio Jaime Irigoyen</title>
+                <title>WhatsApp Bot Activo Â· Estudio Jaime Irigoyen</title>
                 <style>
                     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #0f172a; color: #fff; margin: 0; }
                     .card { background: #1e293b; padding: 40px; border-radius: 20px; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.5); max-width: 450px; width: 90%; }
@@ -40,9 +39,9 @@ app.get('/', (req, res) => {
             </head>
             <body>
                 <div class="card">
-                    <div class="status"><span class="dot"></span> EN LÍNEA Y CONECTADO</div>
+                    <div class="status"><span class="dot"></span> EN LÃNEA Y CONECTADO</div>
                     <h1>WhatsApp Bot Activo</h1>
-                    <p>El bot del <strong>Estudio Jurídico Jaime Irigoyen</strong> está conectado a tu WhatsApp Business y respondiendo consultas con Inteligencia Artificial.</p>
+                    <p>El bot del <strong>Estudio JurÃ­dico Jaime Irigoyen</strong> estÃ¡ conectado a tu WhatsApp Business y respondiendo consultas con Inteligencia Artificial.</p>
                 </div>
             </body>
             </html>
@@ -58,7 +57,7 @@ app.get('/', (req, res) => {
                 <head>
                     <meta charset="UTF-8">
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Vincular WhatsApp · Estudio Jaime Irigoyen</title>
+                    <title>Vincular WhatsApp Â· Estudio Jaime Irigoyen</title>
                     <meta http-equiv="refresh" content="5">
                     <style>
                         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #0f172a; color: #fff; margin: 0; }
@@ -75,16 +74,16 @@ app.get('/', (req, res) => {
                 <body>
                     <div class="card">
                         <h1>Vincular WhatsApp</h1>
-                        <p>Escaneá este código desde tu celular con el número <strong>+54 9 11 3236-4365</strong>.</p>
+                        <p>EscaneÃ¡ este cÃ³digo desde tu celular con el nÃºmero <strong>+54 9 11 3236-4365</strong>.</p>
                         <div class="qr-box">
-                            <img src="${url}" alt="Código QR de WhatsApp" />
+                            <img src="${url}" alt="CÃ³digo QR de WhatsApp" />
                         </div>
                         <div class="instructions">
                             <ol>
-                                <li>Abrí <strong>WhatsApp Business</strong> en tu celular.</li>
-                                <li>Tocá los <strong>tres puntos (⋮)</strong> o Configuración.</li>
-                                <li>Seleccioná <strong>Dispositivos vinculados</strong>.</li>
-                                <li>Tocá <strong>Vincular un dispositivo</strong> y apuntá al código QR.</li>
+                                <li>AbrÃ­ <strong>WhatsApp Business</strong> en tu celular.</li>
+                                <li>TocÃ¡ los <strong>tres puntos (â‹®)</strong> o ConfiguraciÃ³n.</li>
+                                <li>SeleccionÃ¡ <strong>Dispositivos vinculados</strong>.</li>
+                                <li>TocÃ¡ <strong>Vincular un dispositivo</strong> y apuntÃ¡ al cÃ³digo QR.</li>
                             </ol>
                         </div>
                     </div>
@@ -98,42 +97,34 @@ app.get('/', (req, res) => {
             <html>
             <head><meta http-equiv="refresh" content="3"><title>Iniciando...</title></head>
             <body style="background:#0f172a;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;">
-                <p>Generando código QR... por favor esperá unos segundos.</p>
+                <p>Generando cÃ³digo QR... por favor esperÃ¡ unos segundos.</p>
             </body>
             </html>
         `);
     }
 });
 
-// Función para consultar a Google Gemini AI
+// FunciÃ³n para consultar a Google Gemini AI
 async function consultarGemini(remitenteId, mensajeTexto) {
     return new Promise((resolve) => {
         let historial = userHistories.get(remitenteId) || [];
 
         if (historial.length === 0) {
-            const adminRulesText = globalAdminRules.length > 0 
-                ? '\nREGLAS ADICIONALES DEL ADMINISTRADOR (APLICAR INMEDIATAMENTE):\n- ' + globalAdminRules.join('\n- ') 
-                : '';
-
-            const instrucciones = "Sos el asistente virtual oficial del Estudio Jurídico Jaime Irigoyen, especializado en derecho societario argentino (SAS, SRL, SA, Asociaciones Civiles, ONGs).\n" +
+            const instrucciones = "Hola. Sos el asistente virtual oficial del Estudio JurÃ­dico Jaime Irigoyen, especializado en derecho societario argentino (SAS, SRL, SA, Asociaciones Civiles, ONGs).\n" +
                 "REGLAS OBLIGATORIAS:\n" +
-                "1. Tono ESTRICTAMENTE FORMAL y PROFESIONAL en todo momento.\n" +
-                "2. En el PRIMER mensaje SIEMPRE pedí el nombre y apellido de la persona. Una vez que te lo den, dirigite SIEMPRE a ella como 'Sr.', 'Sra.' o 'Srta.' seguido de su apellido. NUNCA uses trato informal.\n" +
-                "3. Usa la frase 'Esa es una excelente consulta' COMO MÁXIMO UNA SOLA VEZ en toda la conversación, y SOLO si la pregunta es específicamente sobre derecho societario.\n" +
-                "4. NUNCA des asesoramiento legal específico ni redactes contratos.\n" +
-                "5. Si preguntan precios exactos o trámites complejos, respondé formalmente que un abogado del Estudio se comunicará a la brevedad para asesorarlo en detalle.\n" +
-                "6. Sé conciso (máximo 2 a 3 oraciones breves). Estás respondiendo por WhatsApp.\n" +
-                "7. Servicios: Constitución, mantenimiento societario (balances, asambleas, cambio de autoridades) y procesos de disolución/cierre." + 
-                adminRulesText;
+                "1. NUNCA des asesoramiento legal especÃ­fico ni redactes contratos.\n" +
+                "2. Si preguntan precios exactos o trÃ¡mites complejos, decÃ­ amablemente: 'Esa es una excelente consulta. Un abogado del Estudio se comunicarÃ¡ a la brevedad con vos para asesorarte en detalle. Â¿Me podrÃ­as confirmar tu nombre y correo electrÃ³nico?'\n" +
+                "3. SÃ© conciso, profesional y cÃ¡lido (mÃ¡ximo 2 a 3 oraciones breves). EstÃ¡s respondiendo por WhatsApp.\n" +
+                "4. Servicios: ConstituciÃ³n, mantenimiento societario (balances, asambleas ordinarias/extraordinarias, cambio de autoridades/gerencias) y procesos de disoluciÃ³n/cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.\n" +
+                "A partir de ahora, respondÃ© respetando estas reglas.";
 
             historial.push({ role: "user", parts: [{ text: instrucciones }] });
-            historial.push({ role: "model", parts: [{ text: "Entendido. Actuaré como el asistente virtual formal del Estudio Jaime Irigoyen siguiendo estrictamente estas reglas." }] });
+            historial.push({ role: "model", parts: [{ text: "Entendido. ActuarÃ© como el asistente virtual del Estudio Jaime Irigoyen siguiendo estrictamente estas reglas." }] });
         }
 
         historial.push({ role: "user", parts: [{ text: mensajeTexto }] });
 
-        // MODELO OFICIAL CORRECTO
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
         const payload = JSON.stringify({
             contents: historial,
             generationConfig: {
@@ -159,8 +150,8 @@ async function consultarGemini(remitenteId, mensajeTexto) {
                         const reply = parsed.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
                         if (reply) {
                             historial.push({ role: "model", parts: [{ text: reply }] });
-                            if (historial.length > 14) {
-                                historial = [...historial.slice(0, 2), ...historial.slice(-12)];
+                            if (historial.length > 12) {
+                                historial = [...historial.slice(0, 2), ...historial.slice(-10)];
                             }
                             userHistories.set(remitenteId, historial);
                             return resolve(reply);
@@ -169,13 +160,13 @@ async function consultarGemini(remitenteId, mensajeTexto) {
                         console.error('Error parseando respuesta de Gemini:', e);
                     }
                 }
-                resolve("Disculpe, en este momento estoy teniendo un inconveniente técnico. Un abogado del estudio se comunicará con usted a la brevedad.");
+                resolve("DisculpÃ¡, en este momento estoy teniendo un inconveniente tÃ©cnico. Un abogado del estudio se comunicarÃ¡ con vos a la brevedad.");
             });
         });
 
         req.on('error', (err) => {
             console.error('Error en llamada a Gemini:', err);
-            resolve("Disculpe, en este momento estoy teniendo un inconveniente técnico. Un abogado del estudio se comunicará con usted a la brevedad.");
+            resolve("DisculpÃ¡, en este momento estoy teniendo un inconveniente tÃ©cnico. Un abogado del estudio se comunicarÃ¡ con vos a la brevedad.");
         });
 
         req.write(payload);
@@ -183,7 +174,7 @@ async function consultarGemini(remitenteId, mensajeTexto) {
     });
 }
 
-// Inicializar conexión con WhatsApp
+// Inicializar conexiÃ³n con WhatsApp
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
@@ -199,20 +190,19 @@ async function connectToWhatsApp() {
         if (qr) {
             currentQR = qr;
             isConnected = false;
-            console.log('Nuevo código QR generado.');
+            console.log('Nuevo cÃ³digo QR generado.');
         }
 
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Conexión cerrada. Error:', lastDisconnect?.error); 
-            console.log('Reconectando:', shouldReconnect);
+            console.log('Conexión cerrada. Error:', lastDisconnect?.error); console.log('Reconectando:', shouldReconnect);
             isConnected = false;
             currentQR = null;
             if (shouldReconnect) {
                 setTimeout(connectToWhatsApp, 5000);
             }
         } else if (connection === 'open') {
-            console.log('¡Conexión establecida con WhatsApp exitosamente!');
+            console.log('Â¡ConexiÃ³n establecida con WhatsApp exitosamente!');
             isConnected = true;
             currentQR = null;
         }
@@ -237,16 +227,7 @@ async function connectToWhatsApp() {
 
             console.log(`Mensaje entrante de ${sender}: ${text}`);
 
-            // === MODO ADMINISTRADOR OCULTO ===
-            if (text.startsWith('ADMIN: ')) {
-                const nuevaRegla = text.replace('ADMIN: ', '').trim();
-                globalAdminRules.push(nuevaRegla);
-                await sock.sendMessage(sender, { text: `✅ Regla guardada exitosamente en la memoria:\n"${nuevaRegla}"\n\nEl bot la aplicará a los próximos clientes que escriban.` });
-                console.log(`[ADMIN] Nueva regla guardada: ${nuevaRegla}`);
-                continue; // Evita que Gemini responda a este mensaje de configuración
-            }
-
-            // Enviar indicador de que el bot está escribiendo
+            // Enviar indicador de que el bot estÃ¡ escribiendo
             await sock.sendPresenceUpdate('composing', sender);
 
             // Obtener respuesta de Gemini
