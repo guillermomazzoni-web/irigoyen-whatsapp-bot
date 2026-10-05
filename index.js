@@ -54,7 +54,7 @@ async function consultarGemini(remitenteId, mensajeTexto) {
 
         historial.push({ role: 'user', parts: [{ text: mensajeTexto }] });
 
-        const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + GEMINI_API_KEY;
+        const apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=' + GEMINI_API_KEY;
         const payload = JSON.stringify({
             contents: historial,
             generationConfig: {
