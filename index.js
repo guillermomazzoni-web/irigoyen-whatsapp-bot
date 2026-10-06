@@ -1,11 +1,11 @@
-﻿/**
+/**
  * WhatsApp Bridge con Baileys + Google Gemini AI
  * Estudio Jurídico Jaime Irigoyen
  *
  * Variables de entorno:
  *   GEMINI_API_KEY   (obligatoria) Clave de la API de Gemini.
  *   ADMIN_NUMBER     (opcional)    Número del administrador, solo dígitos y con código de país.
- *                                  Ej: 5491112345678. Si no se configura, los comandos ADMIN quedan desactivados.
+ *                                  Si no se configura, se usa 5491138010344.
  *   PANEL_PASSWORD   (opcional)    Si se configura, la página del QR pide ?clave=... en la URL.
  *   PORT             (opcional)    Puerto del servidor web (por defecto 3000).
  */
@@ -22,7 +22,8 @@ const PORT = process.env.PORT || 3000;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = 'gemini-3.5-flash-lite'; // Modelo que ya funciona en producción
-const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '').replace(/\D/g, '');
+// Número del administrador. Si se configura la variable ADMIN_NUMBER en el servidor, tiene prioridad.
+const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '5491138010344').replace(/\D/g, '');
 const PANEL_PASSWORD = process.env.PANEL_PASSWORD || '';
 
 const AUTH_FOLDER = 'auth_info_baileys';
