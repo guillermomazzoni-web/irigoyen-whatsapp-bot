@@ -263,15 +263,33 @@ function esAdmin(msg) {
 async function procesarComandoAdmin(sock, sender, text) {
     const comando = text.trim();
 
-    if (/^ADMIN LISTAR$/i.test(comando)) {
+    if (/^ADMIN\s+LISTAR$/i.test(comando)) {
         const lista = globalAdminRules.length > 0
-            ? globalAdminRules.map((r, i) => `${i + 1}. ${r}`).join('\n')
+            ? globalAdminRules.map((r, i) => `${i + 1}. ${r}`).join('\n') +
+              '\n\nPara borrar una regla envíe "ADMIN BORRAR" seguido del número. Ej: ADMIN BORRAR 2'
             : 'No hay reglas guardadas.';
         await sock.sendMessage(sender, { text: `📋 Reglas actuales:\n${lista}` });
         return;
     }
 
-    if (/^ADMIN BORRAR$/i.test(comando)) {
+    const borrarUna = comando.match(/^ADMIN\s+BORRAR\s+(\d+)$/i);
+    if (borrarUna) {
+        const numero = parseInt(borrarUna[1], 10);
+        if (numero < 1 || numero > globalAdminRules.length) {
+            await sock.sendMessage(sender, { text: `⚠️ No existe la regla ${numero}. Envíe "ADMIN LISTAR" para ver los números de cada regla.` });
+            return;
+        }
+        const [eliminada] = globalAdminRules.splice(numero - 1, 1);
+        guardarReglas();
+        const restantes = globalAdminRules.length > 0
+            ? globalAdminRules.map((r, i) => `${i + 1}. ${r}`).join('\n')
+            : 'No quedan reglas guardadas.';
+        await sock.sendMessage(sender, { text: `🗑️ Regla ${numero} eliminada:\n"${eliminada}"\n\n📋 Reglas actuales:\n${restantes}` });
+        console.log(`[ADMIN] Regla eliminada: ${eliminada}`);
+        return;
+    }
+
+    if (/^ADMIN\s+BORRAR$/i.test(comando)) {
         globalAdminRules = [];
         guardarReglas();
         await sock.sendMessage(sender, { text: '🗑️ Se borraron todas las reglas del administrador.' });
@@ -355,7 +373,7 @@ async function connectToWhatsApp() {
                 console.log(`Mensaje entrante de ${sender}: ${text}`);
 
                 // Comandos del administrador (solo desde el número configurado en ADMIN_NUMBER)
-                if (/^ADMIN(:|\s+LISTAR$|\s+BORRAR$)/i.test(text.trim()) && esAdmin(msg)) {
+                if (/^ADMIN(:|\s+LISTAR$|\s+BORRAR(\s+\d+)?$)/i.test(text.trim()) && esAdmin(msg)) {
                     await procesarComandoAdmin(sock, sender, text);
                     continue;
                 }
