@@ -172,28 +172,11 @@ app.get('/', (req, res) => {
 
 // ---------- Consulta a Google Gemini ----------
 
-function consultarGemini(remitenteId, mensajeTexto) {
+// Llamada genérica a Gemini. Devuelve el texto de la respuesta, o null si hubo un error.
+function llamarGemini(contents, generationConfig) {
     return new Promise((resolve) => {
-        const historial = userHistories.get(remitenteId) || [];
-        const mensajeUsuario = { role: 'user', parts: [{ text: mensajeTexto }] };
-
-        // Las instrucciones se arman en cada consulta, así las reglas nuevas del administrador
-        // se aplican también a las conversaciones que ya estaban en curso.
-        const contents = [
-            { role: 'user', parts: [{ text: construirInstrucciones() }] },
-            { role: 'model', parts: [{ text: 'Entendido. Actuaré como el asistente virtual formal del Estudio Jaime Irigoyen siguiendo estrictamente estas reglas.' }] },
-            ...historial,
-            mensajeUsuario
-        ];
-
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-        const payload = JSON.stringify({
-            contents,
-            generationConfig: {
-                maxOutputTokens: 250,
-                temperature: 0.5
-            }
-        });
+        const payload = JSON.stringify({ contents, generationConfig });
 
         const req = https.request(url, {
             method: 'POST',
@@ -209,13 +192,8 @@ function consultarGemini(remitenteId, mensajeTexto) {
                 if (res.statusCode === 200) {
                     try {
                         const parsed = JSON.parse(data);
-                        const reply = parsed.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-                        if (reply) {
-                            // El historial solo se actualiza si hubo respuesta, para no dejar mensajes sin contestar
-                            const nuevoHistorial = [...historial, mensajeUsuario, { role: 'model', parts: [{ text: reply }] }];
-                            userHistories.set(remitenteId, nuevoHistorial.slice(-MAX_TURNOS_HISTORIAL));
-                            return resolve(reply);
-                        }
+                        const texto = parsed.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+                        if (texto) return resolve(texto);
                         console.error('Gemini respondió sin texto:', data);
                     } catch (e) {
                         console.error('Error parseando respuesta de Gemini:', e);
@@ -226,23 +204,137 @@ function consultarGemini(remitenteId, mensajeTexto) {
                     console.error('Detalle:', data);
                     console.error('=======================\n');
                 }
-                resolve(MENSAJE_ERROR);
+                resolve(null);
             });
         });
 
-        // Si Gemini no responde en 15 segundos, se corta la conexión (antes quedaba colgada)
+        // Si Gemini no responde en 15 segundos, se corta la conexión
         req.on('timeout', () => {
             req.destroy(new Error('Tiempo de espera agotado (15 s)'));
         });
 
         req.on('error', (err) => {
             console.error('Error en llamada a Gemini:', err.message);
-            resolve(MENSAJE_ERROR);
+            resolve(null);
         });
 
         req.write(payload);
         req.end();
     });
+}
+
+async function consultarGemini(remitenteId, mensajeTexto) {
+    const historial = userHistories.get(remitenteId) || [];
+    const mensajeUsuario = { role: 'user', parts: [{ text: mensajeTexto }] };
+
+    // Las instrucciones se arman en cada consulta, así las reglas nuevas del administrador
+    // se aplican también a las conversaciones que ya estaban en curso.
+    const contents = [
+        { role: 'user', parts: [{ text: construirInstrucciones() }] },
+        { role: 'model', parts: [{ text: 'Entendido. Actuaré como el asistente virtual formal del Estudio Jaime Irigoyen siguiendo estrictamente estas reglas.' }] },
+        ...historial,
+        mensajeUsuario
+    ];
+
+    const reply = await llamarGemini(contents, { maxOutputTokens: 250, temperature: 0.5 });
+    if (!reply) return MENSAJE_ERROR;
+
+    // El historial solo se actualiza si hubo respuesta, para no dejar mensajes sin contestar
+    const nuevoHistorial = [...historial, mensajeUsuario, { role: 'model', parts: [{ text: reply }] }];
+    userHistories.set(remitenteId, nuevoHistorial.slice(-MAX_TURNOS_HISTORIAL));
+    return reply;
+}
+
+// ---------- Aviso de contacto nuevo al administrador ----------
+
+const REGEX_EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+const MAX_MENSAJES_CLIENTE = 20;
+const mensajesCliente = new Map();   // Todo lo que escribió cada cliente (para el resumen)
+const contactosAvisados = new Set(); // Para no avisar dos veces por el mismo cliente y correo
+
+function registrarMensajeCliente(sender, text) {
+    const lista = mensajesCliente.get(sender) || [];
+    lista.push(text);
+    mensajesCliente.set(sender, lista.slice(-MAX_MENSAJES_CLIENTE));
+}
+
+// Obtiene el número de WhatsApp real del cliente (según la versión de Baileys puede venir en distintos campos)
+function numeroCliente(msg) {
+    const candidatos = [msg.key.senderPn, msg.key.remoteJidAlt, msg.key.remoteJid]
+        .filter(j => j && j.endsWith('@s.whatsapp.net'));
+    return candidatos.length > 0 ? soloDigitos(candidatos[0]) : null;
+}
+
+async function extraerDatosContacto(sender) {
+    const conversacion = (mensajesCliente.get(sender) || []).map(t => `- ${t}`).join('\n');
+    const prompt =
+        'A partir de los siguientes mensajes que un cliente envió al Estudio Jurídico Jaime Irigoyen por WhatsApp, ' +
+        'extraé su nombre y apellido, y escribí un resumen breve (máximo 3 oraciones) de lo que consulta.\n' +
+        'Respondé ÚNICAMENTE con un JSON con este formato: {"nombre": "...", "resumen": "..."}\n' +
+        'Si el nombre no aparece, poné "No indicado".\n\n' +
+        'Mensajes del cliente:\n' + conversacion;
+
+    const respuesta = await llamarGemini(
+        [{ role: 'user', parts: [{ text: prompt }] }],
+        { maxOutputTokens: 300, temperature: 0.2, responseMimeType: 'application/json' }
+    );
+
+    if (respuesta) {
+        try {
+            const limpio = respuesta.replace(/```json|```/g, '').trim();
+            const datos = JSON.parse(limpio);
+            return {
+                nombre: datos.nombre || 'No indicado',
+                resumen: datos.resumen || 'No disponible'
+            };
+        } catch (e) {
+            console.error('No se pudo leer el resumen del contacto:', respuesta);
+        }
+    }
+    // Si Gemini falla, se manda el aviso igual con los últimos mensajes del cliente
+    return {
+        nombre: 'No se pudo detectar (ver mensajes)',
+        resumen: 'Últimos mensajes del cliente:\n' + (mensajesCliente.get(sender) || []).slice(-5).map(t => `• ${t}`).join('\n')
+    };
+}
+
+async function obtenerJidAdmin(sock) {
+    try {
+        const [resultado] = await sock.onWhatsApp(ADMIN_NUMBER);
+        if (resultado?.exists && resultado.jid) return resultado.jid;
+    } catch (e) {
+        console.error('No se pudo verificar el número del administrador:', e.message);
+    }
+    return `${ADMIN_NUMBER}@s.whatsapp.net`;
+}
+
+async function avisarContactoNuevo(sock, msg, sender, email) {
+    if (!ADMIN_NUMBER) return;
+    const clave = `${sender}|${email.toLowerCase()}`;
+    if (contactosAvisados.has(clave)) return;
+    contactosAvisados.add(clave);
+
+    try {
+        const { nombre, resumen } = await extraerDatosContacto(sender);
+        const numero = numeroCliente(msg);
+        const lineaNumero = numero
+            ? `+${numero}\nwa.me/${numero}`
+            : 'No disponible (WhatsApp ocultó el número). Puede responderle desde el chat del bot.';
+
+        const aviso =
+            '📩 *NUEVO CONTACTO*\n\n' +
+            `👤 *Nombre:* ${nombre}\n` +
+            `✉️ *Correo:* ${email}\n` +
+            `📱 *WhatsApp:* ${lineaNumero}\n\n` +
+            `📝 *Consulta:*\n${resumen}`;
+
+        const jidAdmin = await obtenerJidAdmin(sock);
+        await sock.sendMessage(jidAdmin, { text: aviso });
+        console.log(`[AVISO] Contacto nuevo enviado al administrador: ${nombre} - ${email}`);
+    } catch (e) {
+        contactosAvisados.delete(clave); // Si falló, se permite reintentar con el próximo mensaje
+        console.error('Error enviando el aviso de contacto nuevo:', e);
+    }
 }
 
 // ---------- Comandos del administrador ----------
@@ -378,6 +470,8 @@ async function connectToWhatsApp() {
                     continue;
                 }
 
+                registrarMensajeCliente(sender, text);
+
                 // Indicador de "escribiendo..."
                 await sock.sendPresenceUpdate('composing', sender);
 
@@ -388,6 +482,10 @@ async function connectToWhatsApp() {
 
                 await sock.sendMessage(sender, { text: respuestaAI });
                 console.log(`Respuesta enviada a ${sender}: ${respuestaAI}`);
+
+                // Si el cliente dejó su correo, se avisa al administrador (en segundo plano, sin demorar al cliente)
+                const email = text.match(REGEX_EMAIL)?.[0];
+                if (email) avisarContactoNuevo(sock, msg, sender, email);
             } catch (e) {
                 console.error('Error procesando un mensaje:', e);
             }
