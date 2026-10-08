@@ -181,6 +181,9 @@ async function inicializarDB() {
             );
         `);
         await db.query(`CREATE INDEX IF NOT EXISTS idx_turnos_estado ON turnos (estado, inicio)`);
+        await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS token TEXT`);
+        await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS negativas INTEGER DEFAULT 0`);
+        await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS flujo TEXT`);
         dbOk = true;
         console.log('✅ Base de datos inicializada correctamente.');
     } catch (e) {
@@ -594,10 +597,105 @@ function restarIntervalo(lista, [a, b]) {
     return res;
 }
 
+// ---------- Feriados (el Estudio cierra en feriados nacionales, días puente y Jueves Santo) ----------
+// Fuente: API pública ArgentinaDatos (se guarda en la base para no depender de ella). Jueves y Viernes Santo se
+// calculan. No se cierran los días no laborables de otras religiones.
+
+const FERIADOS = new Map(); // 'AAAA-MM-DD' -> nombre
+const URL_FERIADOS = 'https://api.argentinadatos.com/v1/feriados/';
+const REGEX_OTRAS_RELIGIONES = /jud|isl[aá]m|armeni|yom|kipur|rosh|pesaj|ramad|eid|sacrificio|hegira|musulm/i;
+let feriadosRevisadosEn = 0;
+let feriadosAvisadosEn = 0;
+
+function fechaPascua(anio) {
+    const a = anio % 19, b = Math.floor(anio / 100), c = anio % 100, d = Math.floor(b / 4), e = b % 4;
+    const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+    const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451);
+    const mes = Math.floor((h + l - 7 * m + 114) / 31), dia = ((h + l - 7 * m + 114) % 31) + 1;
+    return `${anio}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
+}
+
+// Feriados que siempre se pueden calcular (respaldo si la API no responde): fijos, Carnaval y Semana Santa.
+function feriadosCalculados(anio) {
+    const pascua = fechaPascua(anio);
+    const fijos = [['01-01', 'Año Nuevo'], ['03-24', 'Día Nacional de la Memoria por la Verdad y la Justicia'],
+        ['04-02', 'Día del Veterano y de los Caídos en la Guerra de Malvinas'], ['05-01', 'Día del Trabajador'],
+        ['05-25', 'Día de la Revolución de Mayo'], ['06-20', 'Paso a la Inmortalidad del General Manuel Belgrano'],
+        ['07-09', 'Día de la Independencia'], ['12-08', 'Inmaculada Concepción de María'], ['12-25', 'Navidad']];
+    return [
+        ...fijos.map(([md, nombre]) => ({ fecha: `${anio}-${md}`, nombre })),
+        { fecha: sumarDiasFecha(pascua, -48), nombre: 'Carnaval' },
+        { fecha: sumarDiasFecha(pascua, -47), nombre: 'Carnaval' },
+        { fecha: sumarDiasFecha(pascua, -3), nombre: 'Jueves Santo' },
+        { fecha: sumarDiasFecha(pascua, -2), nombre: 'Viernes Santo' }
+    ];
+}
+
+async function feriadosDelAnio(anio) {
+    const clave = `feriados:${anio}`;
+    let guardado = null;
+    try { guardado = JSON.parse(await leerConfig(clave) || 'null'); } catch (e) { guardado = null; }
+    if (guardado && guardado.fuente === 'api' && Date.now() - guardado.descargado < 7 * 24 * 3600000) return guardado.lista;
+
+    const r = await solicitudHttps('GET', URL_FERIADOS + anio, { timeout: 15000 });
+    if (r.status === 200 && Array.isArray(r.json) && r.json.length) {
+        const lista = r.json
+            .filter(f => /^\d{4}-\d{2}-\d{2}$/.test(f.fecha) && !REGEX_OTRAS_RELIGIONES.test(f.nombre || ''))
+            .map(f => ({ fecha: f.fecha, nombre: f.nombre || 'Feriado', tipo: f.tipo || null }));
+        const js = sumarDiasFecha(fechaPascua(anio), -3);
+        if (!lista.some(f => f.fecha === js)) lista.push({ fecha: js, nombre: 'Jueves Santo', tipo: 'religioso' });
+        await guardarConfig(clave, JSON.stringify({ fuente: 'api', descargado: Date.now(), lista })).catch(() => {});
+        return lista;
+    }
+    console.error(`No se pudieron descargar los feriados ${anio} (${r.status}). Uso ${guardado ? 'los guardados' : 'los calculados'}.`);
+    return guardado?.lista || feriadosCalculados(anio);
+}
+
+async function cargarFeriados() {
+    const anio = Number(partesBA(Date.now()).fecha.slice(0, 4));
+    const nuevos = new Map();
+    for (const a of [anio, anio + 1]) {
+        let lista;
+        try { lista = await feriadosDelAnio(a); } catch (e) { lista = feriadosCalculados(a); }
+        for (const f of lista) if (!nuevos.has(f.fecha)) nuevos.set(f.fecha, f.nombre);
+    }
+    FERIADOS.clear();
+    for (const [k, v] of nuevos) FERIADOS.set(k, v);
+    feriadosRevisadosEn = Date.now();
+    console.log(`📅 Feriados cargados: ${FERIADOS.size}`);
+}
+
+function nombreFeriado(fecha) {
+    return FERIADOS.get(fecha) || null;
+}
+
+// Avisa al administrador (una sola vez por turno) si hay reuniones confirmadas o pendientes en un feriado cerrado.
+async function avisarTurnosEnFeriados() {
+    try {
+        const { rows } = await db.query(
+            `SELECT * FROM turnos WHERE estado = ANY($1) AND inicio > NOW() ORDER BY inicio`, [ESTADOS_OCUPAN]);
+        for (const t of rows) {
+            const fecha = partesBA(t.inicio).fecha;
+            const feriado = nombreFeriado(fecha);
+            if (!feriado) continue;
+            const abierto = (await cargarExcepciones(fecha, fecha)).some(e => e.tipo === 'abrir');
+            if (abierto) continue;
+            const clave = `aviso_feriado:${t.id}`;
+            if (await leerConfig(clave)) continue;
+            await guardarConfig(clave, '1');
+            await enviarAAdmin(`⚠️ La reunión ${descripcionTurno(t)} cae en feriado (${feriado}) y ese día el Estudio está cerrado. ` +
+                '¿Querés que la mantenga, que le proponga otro horario al cliente o que la cancele?');
+        }
+    } catch (e) {
+        console.error('Error revisando turnos en feriados:', e.message);
+    }
+}
+
 // Franjas de atención de un día (en minutos), aplicando las excepciones cargadas por el administrador.
+// Los feriados quedan cerrados salvo que el administrador abra un horario ese día.
 function franjasDelDia(fecha, excepciones) {
     const dow = partesBA(desdeBA(fecha, '12:00')).dow;
-    let franjas = (HORARIO_BASE[dow] || []).map(([a, b]) => [minutos(a), minutos(b)]);
+    let franjas = nombreFeriado(fecha) ? [] : (HORARIO_BASE[dow] || []).map(([a, b]) => [minutos(a), minutos(b)]);
     for (const e of excepciones.filter(x => x.fecha === fecha && x.tipo === 'abrir')) {
         franjas.push([minutos(e.desde), minutos(e.hasta)]);
     }
@@ -778,13 +876,17 @@ async function confirmarTurno(id) {
     });
     if (!evento) return { ok: false, mensaje: 'No se pudo crear la reunión en Google Calendar.' };
 
-    await actualizarTurno(t.id, { estado: 'confirmado', evento_id: evento.id, meet: evento.meet });
+    const token = require('crypto').randomBytes(16).toString('hex');
+    await actualizarTurno(t.id, { estado: 'confirmado', evento_id: evento.id, meet: evento.meet, token });
     const duracionTxt = t.tipo === 'dudas' ? '15 minutos' : '30 minutos';
     await enviarACliente(t.telefono,
-        `Su reunión quedó confirmada para el ${etiquetaTurno(t.inicio)} (${duracionTxt}), por Google Meet.\n\n` +
-        `Link de la reunión: ${evento.meet}\n\nUn asesor del Estudio lo atenderá. Le enviaremos recordatorios antes del encuentro.` +
+        `Su reunión quedó confirmada para el ${etiquetaTurno(t.inicio)} (${duracionTxt}), por Google Meet, con un asesor del Estudio.\n\n` +
+        `📅 Para agregarla a su agenda: ${PUBLIC_URL}/agenda/${token}\n\n` +
+        'El día anterior le preguntaremos si va a asistir, y 15 minutos antes de la reunión le enviaremos por aquí el link de Google Meet.' +
         (AVISO_GRABACION ? `\n\n${AVISO_GRABACION}` : ''));
-    return { ok: true, mensaje: `Listo, confirmé el turno #${t.id} (${t.nombre || 'cliente'}, ${etiquetaTurno(t.inicio)}). Meet: ${evento.meet}` };
+    const feriado = nombreFeriado(partesBA(t.inicio).fecha);
+    return { ok: true, mensaje: `Listo, confirmé el turno #${t.id} (${t.nombre || 'cliente'}, ${etiquetaTurno(t.inicio)}). Meet: ${evento.meet}` +
+        (feriado ? `\n\n⚠️ Ojo: ese día es feriado (${feriado}).` : '') };
 }
 
 function textoOpciones(opciones) {
@@ -825,10 +927,12 @@ async function proponerHorario(id, fecha, hora) {
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'propuesto') RETURNING *`,
         [t.telefono, t.nombre, t.numero, t.producto, t.motivo, t.tipo, inicio, fin]);
     await enviarACliente(t.telefono, `El asesor le propone reunirse el ${etiquetaTurno(inicio)} por Google Meet. ¿Le queda bien ese horario?`);
-    return { ok: true, mensaje: `Le propuse a ${t.nombre || 'el cliente'} el ${etiquetaTurno(inicio)} (turno #${rows[0].id}). Si acepta, se confirma solo.` };
+    const feriado = nombreFeriado(fecha);
+    return { ok: true, mensaje: `Le propuse a ${t.nombre || 'el cliente'} el ${etiquetaTurno(inicio)} (turno #${rows[0].id}). Si acepta, se confirma solo.` +
+        (feriado ? `\n\n⚠️ Ojo: ese día es feriado (${feriado}).` : '') };
 }
 
-async function cancelarTurno(id, { porCliente = false } = {}) {
+async function cancelarTurno(id, { porCliente = false, silencioso = false } = {}) {
     const t = await obtenerTurno(id);
     if (!t) return { ok: false, mensaje: `No existe el turno #${id}.` };
     if (!ESTADOS_OCUPAN.includes(t.estado)) return { ok: false, mensaje: `El turno #${id} ya estaba ${t.estado}.` };
@@ -837,7 +941,9 @@ async function cancelarTurno(id, { porCliente = false } = {}) {
         if (![200, 204, 404, 410].includes(r.status)) console.error('No se pudo borrar el evento:', r.status, r.texto.slice(0, 200));
     }
     await actualizarTurno(t.id, { estado: porCliente ? 'cancelado_cliente' : 'cancelado' });
-    if (porCliente) {
+    if (silencioso) {
+        // quien llama se encarga de los avisos
+    } else if (porCliente) {
         await enviarAAdmin(`❌ ${t.nombre || 'Un cliente'} canceló su turno del ${etiquetaTurno(t.inicio)} (#${t.id}).`);
     } else {
         await enviarACliente(t.telefono, `Le informamos que la reunión del ${etiquetaTurno(t.inicio)} fue cancelada. Si lo desea, coordinamos un nuevo horario.`);
@@ -862,6 +968,8 @@ async function agregarExcepcion(tipo, fecha, desde, hasta) {
             `SELECT * FROM turnos WHERE estado = 'confirmado' AND inicio < $2 AND fin > $1`, [inicioRango, finRango]);
         if (rows.length) aviso = `\n\n⚠️ Ojo: en ese rango ya hay ${rows.length === 1 ? 'una reunión confirmada' : `${rows.length} reuniones confirmadas`}: ${rows.map(descripcionTurno).join('; ')}. No las cancelé.`;
     }
+    const feriado = nombreFeriado(fecha);
+    if (feriado && tipo === 'abrir') aviso += `\n\nℹ️ Ese día es feriado (${feriado}); queda abierto solo en el horario que me indicaste.`;
     return { ok: true, mensaje: `Listo, ${tipo === 'bloquear' ? 'bloqueé' : 'abrí'} el ${fechaTxt}${rango}.${aviso}` };
 }
 
@@ -879,8 +987,10 @@ async function resumenDisponibilidad(dias = 7) {
         const fecha = sumarDiasFecha(hoy, i);
         const franjas = franjasDelDia(fecha, excepciones);
         const tieneCambios = excepciones.some(e => e.fecha === fecha);
+        const feriado = nombreFeriado(fecha);
         const txt = franjas.length ? franjas.map(([a, b]) => `${horaTexto(a)} a ${horaTexto(b)}`).join(' y ') : 'cerrado';
-        lineas.push(`• ${etiquetaFecha(desdeBA(fecha, '12:00'))}: ${txt}${tieneCambios ? ' (modificado)' : ''}`);
+        const nota = feriado ? ` (feriado: ${feriado}${franjas.length ? ', abierto por vos' : ''})` : (tieneCambios ? ' (modificado)' : '');
+        lineas.push(`• ${etiquetaFecha(desdeBA(fecha, '12:00'))}: ${txt}${nota}`);
     }
     return lineas.join('\n');
 }
@@ -981,6 +1091,15 @@ const HERRAMIENTAS_CLIENTE = [
         parameters: { type: 'OBJECT', properties: {} }
     },
     {
+        name: 'responder_asistencia',
+        description: 'Respuesta del cliente a la pregunta que le hizo el sistema sobre su reunión (si va a asistir, si quiere reagendar o si quiere que lo contactemos más adelante). El sistema le responde solo.',
+        parameters: {
+            type: 'OBJECT',
+            properties: { respuesta: { type: 'STRING', enum: ['si', 'no'], description: '"si" o "no" a la última pregunta indicada en el contexto.' } },
+            required: ['respuesta']
+        }
+    },
+    {
         name: 'cancelar_mi_turno',
         description: 'Cancela el turno activo del cliente, cuando el cliente lo pide expresamente.',
         parameters: { type: 'OBJECT', properties: {} }
@@ -1065,11 +1184,14 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             return { ok: true, estado: 'pendiente de confirmación del asesor', horario: etiquetaTurno(t.inicio) };
         }
 
-        if (nombre === 'confirmar_asistencia') {
+        if (nombre === 'confirmar_asistencia' || nombre === 'responder_asistencia') {
             const t = await turnoActivoCliente(telefono);
             if (!t || t.estado !== 'confirmado') return { error: 'El cliente no tiene una reunión confirmada.' };
-            await actualizarTurno(t.id, { asistencia_confirmada: true });
-            return { ok: true, horario: etiquetaTurno(t.inicio) };
+            const si = nombre === 'confirmar_asistencia' || args.respuesta === 'si';
+            if (t.asistencia_confirmada && si && !t.flujo) return { ok: true, aviso: 'Ya tenía la asistencia confirmada. Recordale que 15 minutos antes le llega el link.' };
+            if (!si && !preguntaAsistenciaAbierta(t)) return { error: 'No hay ninguna pregunta de asistencia pendiente. Si quiere cancelar, usá cancelar_mi_turno.' };
+            await procesarRespuestaAsistencia(t, si);
+            return { ok: true, _silencio: true, aviso: 'El sistema ya le respondió al cliente.' };
         }
 
         if (nombre === 'cancelar_mi_turno') {
@@ -1091,7 +1213,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             }
             const r = await confirmarTurno(t.id);
             if (r.ok) await enviarAAdmin(`✅ ${t.nombre || 'El cliente'} aceptó el ${etiquetaTurno(t.inicio)}. Quedó confirmado.`);
-            return r.ok ? { ok: true, confirmado: true, aviso: 'El sistema ya le envió la confirmación con el link. No repitas el link.' } : { error: r.mensaje };
+            return r.ok ? { ok: true, confirmado: true, aviso: 'El sistema ya le envió la confirmación. El link de Meet le llega 15 minutos antes; no lo compartas.' } : { error: r.mensaje };
         }
     } catch (e) {
         console.error(`Error en herramienta ${nombre}:`, e.message);
@@ -1109,6 +1231,96 @@ function detectarProducto(textos) {
     if (/\bS\.?\s?R\.?\s?L\b/.test(t)) return 'SRL';
     if (/\bS\.?\s?A\b|SOCIEDAD AN[OÓ]NIMA/.test(t)) return 'SA';
     return 'Otra consulta';
+}
+
+async function registrarAsistencia(t) {
+    await actualizarTurno(t.id, { asistencia_confirmada: true, flujo: null });
+    await enviarACliente(t.telefono,
+        `¡Muchas gracias por confirmar! Lo esperamos el ${etiquetaTurno(t.inicio)}.\n\n` +
+        '15 minutos antes de la reunión le enviaremos por aquí el link de Google Meet.');
+    await enviarAAdmin(`✅ ${t.nombre || 'El cliente'} confirmó asistencia a la reunión del ${etiquetaTurno(t.inicio)} (#${t.id}).`);
+}
+
+// ---------- Respuesta del cliente a "¿Va a asistir?" ----------
+// Sin presionar: 1.ª negativa → ofrecer reagendar; 2.ª → ofrecer contactarlo más adelante; 3.ª → se cancela y nos retiramos.
+
+function esAfirmativoCliente(texto) {
+    const n = normalizarTexto(texto);
+    return esAfirmativo(texto) || (n.length <= 40 &&
+        /^(si |dale )?(voy|ahi voy|asisto|asistire|ahi estare|ahi estoy|alli estare|estare|estaremos|cuenten conmigo|confirmo asistencia|si voy|si asisto|por supuesto|seguro|si claro|claro que si)( gracias| por favor)?$/.test(n));
+}
+
+function esNegativoCliente(texto) {
+    const n = normalizarTexto(texto);
+    return esNegativo(texto) || (n.length <= 50 &&
+        /^(no )?(no puedo|no voy|no podre|no voy a poder|no asistire|no llego|imposible|no me es posible|no creo|lamentablemente no|no puedo ir|no puedo asistir|no por ahora|no por el momento|ahora no)( gracias| lo siento| perdon| disculpe)?$/.test(n));
+}
+
+// Hay una pregunta de asistencia abierta si se mandó algún recordatorio con pregunta o si estamos en el flujo de negativas.
+function preguntaAsistenciaAbierta(t) {
+    if (!t || t.estado !== 'confirmado' || t.asistencia_confirmada) return false;
+    const r = t.recordatorios || {};
+    return Boolean(t.flujo) || ['c24', 'c12', 'c60'].some(c => r[c] === 'enviado');
+}
+
+async function ofrecerReagenda(t) {
+    const libres = await horariosLibres({ tipo: t.tipo });
+    const opciones = libres ? elegirOpciones(libres, t.tipo) : [];
+    if (!opciones.length) {
+        await enviarACliente(t.telefono, 'Perfecto. En este momento no tengo horarios disponibles para ofrecerle; un asesor del Estudio se comunicará con usted para coordinar uno nuevo.');
+        return;
+    }
+    await guardarOpcionesOfrecidas(t.telefono, opciones, t.tipo);
+    await enviarACliente(t.telefono, `Perfecto, liberamos el horario anterior. Le puedo ofrecer:\n\n${textoOpciones(opciones)}\n\nIndíquenos el número de su preferencia.`);
+}
+
+async function procesarRespuestaAsistencia(t, asiste) {
+    const quien = t.nombre || 'El cliente';
+    if (asiste) {
+        if (t.flujo === 'n1') {
+            // Aceptó reagendar.
+            await cancelarTurno(t.id, { porCliente: true, silencioso: true });
+            await enviarAAdmin(`🔄 ${quien} no puede asistir el ${etiquetaTurno(t.inicio)} (#${t.id}) y aceptó reagendar. Cancelé la reunión y le ofrecí nuevos horarios.`);
+            await ofrecerReagenda(t);
+            return;
+        }
+        if (t.flujo === 'n2') {
+            // Aceptó que lo contactemos más adelante.
+            await cancelarTurno(t.id, { porCliente: true, silencioso: true });
+            await enviarACliente(t.telefono, 'Muy bien. Cancelamos la reunión y más adelante nos comunicaremos con usted. Quedamos a su disposición. ¡Que tenga un buen día!');
+            await enviarAAdmin(`📌 ${quien} no puede asistir el ${etiquetaTurno(t.inicio)} (#${t.id}) y pidió que lo contactemos más adelante. Cancelé la reunión.`);
+            return;
+        }
+        await registrarAsistencia(t);
+        return;
+    }
+    const negativas = (t.negativas || 0) + 1;
+    if (!t.flujo) {
+        await actualizarTurno(t.id, { negativas, flujo: 'n1' });
+        await enviarACliente(t.telefono, 'Entendemos, no se preocupe. ¿Le gustaría que busquemos otro día y horario para la reunión?');
+        await enviarAAdmin(`⚠️ ${quien} avisó que no podría asistir a la reunión del ${etiquetaTurno(t.inicio)} (#${t.id}). Le ofrecí reagendar.`);
+        return;
+    }
+    if (t.flujo === 'n1') {
+        await actualizarTurno(t.id, { negativas, flujo: 'n2' });
+        await enviarACliente(t.telefono, 'De acuerdo. ¿Prefiere que lo contactemos más adelante para coordinar en otro momento?');
+        return;
+    }
+    // Tercera negativa: cancelamos con amabilidad y no insistimos más.
+    await actualizarTurno(t.id, { negativas, flujo: 'retirado' });
+    await cancelarTurno(t.id, { porCliente: true, silencioso: true });
+    await enviarACliente(t.telefono, `Entendido. Cancelamos la reunión del ${etiquetaTurno(t.inicio)}. Si más adelante necesita algo, puede escribirnos por aquí cuando quiera. ¡Muchas gracias y que tenga un buen día!`);
+    await enviarAAdmin(`❌ ${quien} no podrá asistir a la reunión del ${etiquetaTurno(t.inicio)} (#${t.id}) y no quiso reagendar ni que lo contactemos. Cancelé la reunión y no le vamos a insistir.`);
+}
+
+// Si el cliente responde "sí" o "no" a una pregunta de asistencia abierta, se procesa sin pasar por Gemini.
+async function asistenciaDirecta(telefono, texto) {
+    const si = esAfirmativoCliente(texto), no = !si && esNegativoCliente(texto);
+    if (!si && !no) return false;
+    const t = await turnoActivoCliente(telefono);
+    if (!preguntaAsistenciaAbierta(t)) return false;
+    await procesarRespuestaAsistencia(t, si);
+    return true;
 }
 
 async function eleccionDirecta(telefono, texto) {
@@ -1136,7 +1348,16 @@ async function contextoCliente(telefono) {
         const t = await turnoActivoCliente(telefono);
         if (t) {
             const estados = { pendiente_admin: 'pendiente de confirmación del asesor', propuesto: 'propuesto por el asesor, esperando respuesta del cliente', confirmado: 'confirmado' };
-            partes.push(`Este cliente tiene un turno ${estados[t.estado]}: ${etiquetaTurno(t.inicio)}${t.meet ? `, link ${t.meet}` : ''}${t.asistencia_confirmada ? ', asistencia confirmada' : ''}.`);
+            const linkVisible = (t.recordatorios || {}).c15 === 'enviado' || Date.now() >= new Date(t.inicio).getTime() - 15 * 60000;
+            const preguntas = {
+                n1: 'El cliente dijo que no puede asistir; el sistema le preguntó si quiere reagendar. Si responde, usá responder_asistencia ("si" = reagendar).',
+                n2: 'El cliente no quiso reagendar; el sistema le preguntó si prefiere que lo contactemos más adelante. Si responde, usá responder_asistencia.'
+            };
+            partes.push(`Este cliente tiene un turno ${estados[t.estado]}: ${etiquetaTurno(t.inicio)}` +
+                (t.asistencia_confirmada ? ', asistencia confirmada' : ', todavía no confirmó asistencia') +
+                (linkVisible && t.meet ? `. Link de la reunión: ${t.meet}` : '. El link de Meet se le envía automáticamente 15 minutos antes; no lo compartas ni lo inventes antes') + '.');
+            if (t.estado === 'confirmado' && preguntas[t.flujo]) partes.push(preguntas[t.flujo]);
+            else if (preguntaAsistenciaAbierta(t)) partes.push('El sistema le preguntó si va a asistir. Si responde sí o no (aunque sea con otras palabras), usá responder_asistencia. Nunca insistas ni presiones.');
         }
         const ofrecidas = await leerOpcionesOfrecidas(telefono);
         if (ofrecidas && !t) {
@@ -1148,6 +1369,75 @@ async function contextoCliente(telefono) {
 }
 
 // ---------- Servidor web ----------
+
+// ---------- Página para agregar la reunión a la agenda del cliente ----------
+// No muestra el link de Meet: ese se envía por WhatsApp 15 minutos antes.
+
+function fechaIcs(d) {
+    return new Date(d).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+}
+
+function escaparHtml(t) {
+    return String(t || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function escaparIcs(t) {
+    return String(t || '').replace(/\\/g, '\\\\').replace(/;/g, '\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
+}
+
+const TITULO_AGENDA = 'Reunión con Estudio Jaime Irigoyen';
+const DETALLE_AGENDA = 'Reunión por Google Meet con un asesor del Estudio Jaime Irigoyen. El link de la reunión se lo enviaremos por WhatsApp 15 minutos antes de comenzar.';
+
+async function turnoPorToken(token) {
+    if (!/^[a-f0-9]{32}$/.test(token || '')) return null;
+    const { rows } = await db.query('SELECT * FROM turnos WHERE token = $1 LIMIT 1', [token]);
+    return rows[0] || null;
+}
+
+async function enviarIcs(req, res, token) {
+    const t = await turnoPorToken(token).catch(() => null);
+    if (!t || t.estado !== 'confirmado') return res.status(404).send('Reunión no disponible.');
+    const ics = [
+        'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Estudio Jaime Irigoyen//Agenda//ES', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH',
+        'BEGIN:VEVENT',
+        `UID:turno-${t.id}-${t.token.slice(0, 8)}@estudiojaimeirigoyen`,
+        `DTSTAMP:${fechaIcs(new Date())}`,
+        `DTSTART:${fechaIcs(t.inicio)}`,
+        `DTEND:${fechaIcs(new Date(new Date(t.inicio).getTime() + (t.tipo === 'dudas' ? 15 : 30) * 60000))}`,
+        `SUMMARY:${escaparIcs(TITULO_AGENDA)}`,
+        `DESCRIPTION:${escaparIcs(DETALLE_AGENDA)}`,
+        'LOCATION:Google Meet (link por WhatsApp)',
+        'BEGIN:VALARM', 'TRIGGER:-PT30M', 'ACTION:DISPLAY', `DESCRIPTION:${escaparIcs(TITULO_AGENDA)}`, 'END:VALARM',
+        'END:VEVENT', 'END:VCALENDAR'
+    ].join('\r\n');
+    res.set('Content-Type', 'text/calendar; charset=utf-8');
+    res.set('Content-Disposition', 'attachment; filename="reunion-estudio-irigoyen.ics"');
+    res.send(ics);
+}
+
+app.get('/agenda/:token', async (req, res) => {
+    if (req.params.token.endsWith('.ics')) return enviarIcs(req, res, req.params.token.slice(0, -4));
+    const t = await turnoPorToken(req.params.token).catch(() => null);
+    const estilo = `body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f4f1ea;color:#1f2a37;margin:0;padding:16px;box-sizing:border-box}
+        .card{background:#fff;padding:32px 28px;border-radius:16px;max-width:440px;width:100%;box-shadow:0 8px 30px rgba(0,0,0,.08);text-align:center}
+        h1{font-size:1.3rem;margin:0 0 6px} .cuando{font-size:1.1rem;font-weight:600;margin:16px 0 4px;color:#14365d}
+        p{color:#4b5563;line-height:1.5;font-size:.95rem} .marca{font-size:.8rem;letter-spacing:.08em;text-transform:uppercase;color:#8a7350;margin-bottom:14px}
+        a.btn{display:block;padding:14px;border-radius:10px;text-decoration:none;font-weight:600;margin-top:12px}
+        .g{background:#14365d;color:#fff} .i{background:#eef2f7;color:#14365d}`;
+    const pagina = (cuerpo) => `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Reunión · Estudio Jaime Irigoyen</title><style>${estilo}</style></head><body><div class="card"><div class="marca">Estudio Jaime Irigoyen</div>${cuerpo}</div></body></html>`;
+    if (!t) return res.status(404).send(pagina('<h1>Reunión no encontrada</h1><p>Este enlace no es válido. Si necesita ayuda, escríbanos por WhatsApp.</p>'));
+    if (t.estado !== 'confirmado') return res.send(pagina('<h1>Esta reunión ya no está vigente</h1><p>Si desea coordinar un nuevo horario, escríbanos por WhatsApp.</p>'));
+    const fin = new Date(new Date(t.inicio).getTime() + (t.tipo === 'dudas' ? 15 : 30) * 60000);
+    const google = 'https://calendar.google.com/calendar/render?' + new URLSearchParams({
+        action: 'TEMPLATE', text: TITULO_AGENDA, dates: `${fechaIcs(t.inicio)}/${fechaIcs(fin)}`, details: DETALLE_AGENDA, ctz: ZONA_HORARIA
+    }).toString();
+    res.send(pagina(`<h1>Su reunión con el Estudio</h1>
+        <div class="cuando">${escaparHtml(etiquetaTurno(t.inicio))}</div>
+        <p>Por Google Meet, ${t.tipo === 'dudas' ? '15' : '30'} minutos. El link de la reunión se lo enviaremos por WhatsApp 15 minutos antes.</p>
+        <a class="btn g" href="${escaparHtml(google)}" target="_blank" rel="noopener">Agregar a Google Calendar</a>
+        <a class="btn i" href="/agenda/${t.token}.ics">Agregar a otro calendario (iPhone, Outlook)</a>`));
+});
 
 app.get('/', (req, res) => {
     if (PANEL_PASSWORD && req.query.clave !== PANEL_PASSWORD) {
@@ -1345,16 +1635,25 @@ async function consultarGemini(remitenteId, mensajeTexto) {
     const textoUsuario = previo ? previo.parts[0].text + '\n' + mensajeTexto : mensajeTexto;
     const mensajeUsuario = { role: 'user', parts: [{ text: textoUsuario }] };
 
+    const asistencia = await asistenciaDirecta(remitenteId, mensajeTexto).catch(e => { console.error('Asistencia directa:', e.message); return false; });
+    if (asistencia) return ''; // el sistema ya le respondió
+
     const directa = await eleccionDirecta(remitenteId, mensajeTexto).catch(e => { console.error('Elección directa:', e.message); return null; });
     if (directa) return directa;
 
     const instrucciones = construirInstrucciones() + '\n\nCONTEXTO ACTUAL:\n' + await contextoCliente(remitenteId);
+    let silencio = false; // una herramienta ya le respondió al cliente: no se agrega texto del modelo
     const reply = await conversarConHerramientas({
         instrucciones,
         contents: [...base, mensajeUsuario],
         herramientas: HERRAMIENTAS_CLIENTE,
-        ejecutar: (nombre, args) => ejecutarHerramientaCliente(remitenteId, nombre, args)
+        ejecutar: async (nombre, args) => {
+            const r = await ejecutarHerramientaCliente(remitenteId, nombre, args);
+            if (r && r._silencio) { silencio = true; const { _silencio, ...resto } = r; return resto; }
+            return r;
+        }
     });
+    if (silencio) { userHistories.delete(remitenteId); return ''; }
     // El historial se vuelve a leer de la base en cada mensaje: así incluye también los avisos que manda el sistema
     // (confirmaciones, recordatorios) en el orden correcto.
     userHistories.delete(remitenteId);
@@ -1584,7 +1883,7 @@ async function describirAccion(nombre, args) {
     const turno = args.turno_id ? await obtenerTurno(args.turno_id) : null;
     const t = turno ? descripcionTurno(turno) : `turno #${args.turno_id}`;
     switch (nombre) {
-        case 'confirmar_turno': return `confirmar el turno ${t} y mandarle el link de Meet al cliente`;
+        case 'confirmar_turno': return `confirmar el turno ${t} y avisarle al cliente`;
         case 'rechazar_turno': return `rechazar el turno ${t} y ofrecerle otros horarios al cliente`;
         case 'proponer_horario': return `proponerle a ${turno?.nombre || 'el cliente'} el ${etiquetaTurno(desdeBA(args.fecha, normalizarHora(args.hora) || '00:00'))} en lugar de su pedido`;
         case 'cancelar_turno': return `cancelar el turno ${t}, borrarlo del calendario y avisarle al cliente`;
@@ -1720,7 +2019,7 @@ const RECORDATORIOS_CLIENTE = [
     { clave: 'c24', min: 24 * 60 },
     { clave: 'c12', min: 12 * 60 },
     { clave: 'c60', min: 60 },
-    { clave: 'c10', min: 10 }
+    { clave: 'c15', min: 15 }
 ];
 const RECORDATORIOS_ADMIN = [
     { clave: 'a20', min: 20 },
@@ -1728,21 +2027,35 @@ const RECORDATORIOS_ADMIN = [
     { clave: 'a5', min: 5 }
 ];
 
+// Devuelve el texto del recordatorio, o null si no corresponde mandarlo (por ejemplo, si el cliente está en el flujo
+// de "no puedo asistir").
 function textoRecordatorioCliente(clave, t) {
     const cuando = etiquetaTurno(t.inicio);
+    const hora = partesBA(t.inicio).hora;
+    const saludo = t.nombre ? `, ${t.nombre}` : '';
+    const linkAntes = '15 minutos antes de comenzar le enviaremos por aquí el link de Google Meet.';
+    if (t.flujo) return null; // ya dijo que no puede: no insistimos con recordatorios
     switch (clave) {
-        case 'c24': return `Buenas tardes${t.nombre ? `, ${t.nombre}` : ''}. Le recordamos su reunión con un asesor del Estudio el ${cuando} por Google Meet. ¿Nos confirma su asistencia?`;
-        case 'c12': return `Le recordamos su reunión con el Estudio el ${cuando} por Google Meet.`;
-        case 'c60': return `Su reunión con el Estudio comienza en 1 hora (${partesBA(t.inicio).hora} hs).\n\nLink: ${t.meet}`;
-        case 'c10': return `En 10 minutos comienza su reunión con el Estudio.\n\nLink: ${t.meet}`;
+        case 'c24':
+            if (t.asistencia_confirmada) return null;
+            return `Hola${saludo}. Le recordamos su reunión con un asesor del Estudio el ${cuando} por Google Meet.\n\n¿Va a asistir? Por favor responda *sí* o *no*.\n\n${linkAntes}`;
+        case 'c12':
+            if (t.asistencia_confirmada) return `Le recordamos su reunión con el Estudio el ${cuando}. 15 minutos antes le enviaremos el link de Google Meet.`;
+            return `Le recordamos su reunión con el Estudio el ${cuando}. ¿Va a asistir? Responda *sí* o *no*.\n\n${linkAntes}`;
+        case 'c60':
+            if (t.asistencia_confirmada) return `Su reunión con el Estudio comienza en 1 hora (${hora} hs). 15 minutos antes le enviaremos el link.`;
+            return `Su reunión con el Estudio comienza en 1 hora (${hora} hs). ¿Va a asistir? Responda *sí* o *no*. 15 minutos antes le enviaremos el link.`;
+        case 'c15':
+            return `Su reunión con el Estudio comienza en 15 minutos (${hora} hs).\n\n🎥 Link de Google Meet: ${t.meet}`;
     }
-    return '';
+    return null;
 }
 
 function textoRecordatorioAdmin(clave, t) {
     const min = { a20: 20, a10: 10, a5: 5 }[clave];
+    const estado = t.asistencia_confirmada ? ' · confirmó asistencia ✅' : (t.flujo ? ' · avisó que no podría asistir ⚠️' : ' · no respondió si asiste');
     return `⏰ En ${min} minutos: reunión con ${t.nombre || 'cliente'} (${t.producto || 'consulta'}${t.tipo === 'dudas' ? ', dudas de presupuesto' : ''})` +
-        `${t.asistencia_confirmada ? ' · confirmó asistencia ✅' : ''}\n🎥 ${t.meet}`;
+        `${estado}\n🎥 ${t.meet}`;
 }
 
 let revisandoTareas = false;
@@ -1752,6 +2065,10 @@ async function revisarTareas() {
     revisandoTareas = true;
     try {
         const ahora = Date.now();
+
+        // Feriados: se actualizan una vez por día y se avisa si alguna reunión cae en uno.
+        if (ahora - feriadosRevisadosEn > 24 * 3600000) await cargarFeriados().catch(e => console.error('Feriados:', e.message));
+        if (ahora - feriadosAvisadosEn > 24 * 3600000) { feriadosAvisadosEn = ahora; await avisarTurnosEnFeriados(); }
 
         // Pedidos sin respuesta del administrador.
         const { rows: pendientes } = await db.query(`SELECT * FROM turnos WHERE estado = 'pendiente_admin'`);
@@ -1783,9 +2100,11 @@ async function revisarTareas() {
                 const ventana = Math.min(30, r.min / 2) * 60000;
                 nuevos[r.clave] = ahora < momento + ventana ? 'enviado' : 'omitido';
                 if (nuevos[r.clave] === 'omitido') continue;
-                if (r.clave === 'c24' && t.asistencia_confirmada) continue;
-                if (r.clave.startsWith('c')) await enviarACliente(t.telefono, textoRecordatorioCliente(r.clave, t)).catch(e => console.error('Recordatorio:', e.message));
-                else await enviarAAdmin(textoRecordatorioAdmin(r.clave, t));
+                if (r.clave.startsWith('c')) {
+                    const texto = textoRecordatorioCliente(r.clave, t);
+                    if (!texto) { nuevos[r.clave] = 'no_corresponde'; continue; }
+                    await enviarACliente(t.telefono, texto).catch(e => console.error('Recordatorio:', e.message));
+                } else await enviarAAdmin(textoRecordatorioAdmin(r.clave, t));
             }
             if (JSON.stringify(nuevos) !== JSON.stringify(hechos)) await actualizarTurno(t.id, { recordatorios: JSON.stringify(nuevos) });
         }
@@ -2080,6 +2399,7 @@ async function connectToWhatsApp() {
 
                 await sock.sendPresenceUpdate('composing', sender);
                 const respuestaAI = await consultarGemini(sender, text);
+                if (respuestaAI === '') continue; // el sistema ya le respondió al cliente por su cuenta
                 const textoFinal = respuestaAI || MENSAJE_ERROR;
                 await esperar(1500);
                 await sock.sendMessage(sender, { text: textoFinal });
@@ -2110,6 +2430,7 @@ app.listen(PORT, async () => {
     console.log(`Sesión de WhatsApp en: ${AUTH_FOLDER}`);
     await inicializarDB();
     if (dbOk) await cargarReglas();
+    if (dbOk) await cargarFeriados().catch(e => console.error('Feriados:', e.message));
     setTimeout(connectToWhatsApp, 5000);
     setInterval(revisarTareas, 60 * 1000);
 });
@@ -2118,6 +2439,7 @@ module.exports = {
     limpiarNombre, filasAHistorial, numeroCliente, soloDigitos, fechaBA, emailDesdeIdToken, horaCorta,
     partesBA, desdeBA, franjasDelDia, elegirOpciones, horariosLibres, esAfirmativo, esNegativo, etiquetaTurno,
     ejecutarHerramientaCliente, procesarMensajeAdmin, revisarTareas, conversarConHerramientas, confirmarTurno,
-    inicializarDB, guardarConfig, consultarGemini, db,
+    inicializarDB, guardarConfig, consultarGemini, db, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
+    resumenDisponibilidad, avisarTurnosEnFeriados, textoRecordatorioCliente, esAfirmativoCliente, esNegativoCliente,
     _set: (k, v) => { if (k === 'socket') socketActual = v; if (k === 'conectado') isConnected = v; if (k === 'dbOk') dbOk = v; }
 };
