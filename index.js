@@ -184,6 +184,7 @@ async function inicializarDB() {
         await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS token TEXT`);
         await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS negativas INTEGER DEFAULT 0`);
         await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS flujo TEXT`);
+        await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS reemplaza_id INTEGER`);
         dbOk = true;
         console.log('✅ Base de datos inicializada correctamente.');
     } catch (e) {
@@ -730,27 +731,42 @@ async function ocupadoGoogle(desde, hasta) {
     return (r.json.calendars?.primary?.busy || []).map(b => [new Date(b.start).getTime(), new Date(b.end).getTime()]);
 }
 
+// Saca de la lista de ocupados de Google el evento del propio turno (si lo tiene), para poder moverlo.
+async function sinEventoPropio(google, excluirId) {
+    for (const id of [].concat(excluirId || []).filter(Boolean)) {
+        const t = await obtenerTurno(id).catch(() => null);
+        if (!t || !t.evento_id) continue;
+        const a = new Date(t.inicio).getTime(), b = new Date(t.fin).getTime();
+        google = google.filter(([x, y]) => !(x === a && y === b));
+    }
+    return google;
+}
+
 async function ocupadoTurnos(desde, hasta, excluirId = null) {
     try {
         const { rows } = await db.query(
             `SELECT id, inicio, fin FROM turnos WHERE estado = ANY($1) AND fin > $2 AND inicio < $3`,
             [ESTADOS_OCUPAN, desde, hasta]);
-        return rows.filter(t => t.id !== excluirId).map(t => [new Date(t.inicio).getTime(), new Date(t.fin).getTime()]);
+        const excluir = [].concat(excluirId || []);
+        return rows.filter(t => !excluir.includes(t.id)).map(t => [new Date(t.inicio).getTime(), new Date(t.fin).getTime()]);
     } catch (e) {
         return [];
     }
 }
 
 // Devuelve los horarios libres de los próximos días, o null si no se pudo leer la agenda.
-async function horariosLibres({ tipo = 'consulta', dias = DIAS_A_OFRECER, excluirId = null } = {}) {
+// paso: cada cuántos minutos se generan horarios (45 para ofrecer; 15 para validar un horario pedido a mano).
+// excluirId: turno del propio cliente que no debe contar como ocupado (para cambios de horario).
+async function horariosLibres({ tipo = 'consulta', dias = DIAS_A_OFRECER, excluirId = null, paso = PASO_MIN } = {}) {
     const ahora = Date.now();
     const hoy = partesBA(ahora).fecha;
     const ultimo = sumarDiasFecha(hoy, dias);
     const desde = new Date(ahora);
     const hasta = desdeBA(ultimo, '23:59');
 
-    const google = await ocupadoGoogle(desde, hasta);
+    let google = await ocupadoGoogle(desde, hasta);
     if (!google) return null;
+    google = await sinEventoPropio(google, excluirId);
     const ocupado = [...google, ...(await ocupadoTurnos(desde, hasta, excluirId))];
     const excepciones = await cargarExcepciones(hoy, ultimo);
     const duracion = BLOQUE_MIN[tipo] || 45;
@@ -759,7 +775,7 @@ async function horariosLibres({ tipo = 'consulta', dias = DIAS_A_OFRECER, exclui
     for (let i = 0; i <= dias; i++) {
         const fecha = sumarDiasFecha(hoy, i);
         for (const [a, b] of franjasDelDia(fecha, excepciones)) {
-            for (let m = a; m + duracion <= b; m += PASO_MIN) {
+            for (let m = a; m + duracion <= b; m += paso) {
                 const inicio = desdeBA(fecha, horaTexto(m)).getTime();
                 const fin = inicio + duracion * 60000;
                 if (inicio < ahora + ANTICIPACION_MIN * 60000) continue;
@@ -797,11 +813,16 @@ async function obtenerTurno(id) {
     return rows[0] || null;
 }
 
+// Si el cliente tiene una reunión confirmada y además un pedido de cambio en trámite, devuelve la confirmada.
 async function turnoActivoCliente(telefono) {
+    return (await turnosActivosCliente(telefono))[0] || null;
+}
+
+async function turnosActivosCliente(telefono) {
     const { rows } = await db.query(
-        `SELECT * FROM turnos WHERE telefono = $1 AND estado = ANY($2) AND fin > NOW() ORDER BY inicio LIMIT 1`,
+        `SELECT * FROM turnos WHERE telefono = $1 AND estado = ANY($2) AND fin > NOW() ORDER BY (estado = 'confirmado') DESC, inicio`,
         [telefono, ESTADOS_OCUPAN]);
-    return rows[0] || null;
+    return rows;
 }
 
 async function turnosPendientesAdmin() {
@@ -837,24 +858,34 @@ async function enviarAAdmin(texto) {
 }
 
 function textoAvisoTurno(t, segundo = false) {
-    return `${segundo ? '🔔 *Segundo aviso* — sigue pendiente\n\n' : ''}📅 *Pedido de turno #${t.id}*\n\n` +
+    const cambio = t.cambio_de ? `🔄 *Cambio de horario* (antes: ${t.cambio_de})\n` : '';
+    return `${segundo ? '🔔 *Segundo aviso* — sigue pendiente\n\n' : ''}📅 *Pedido de turno #${t.id}*\n${cambio}\n` +
         `👤 ${t.nombre || 'Sin nombre'}${t.numero ? ` (+${t.numero})` : ''}\n` +
         `📝 ${t.producto || 'Consulta'}${t.motivo ? `: ${t.motivo}` : ''}\n` +
         `🕒 ${etiquetaTurno(t.inicio)}${t.tipo === 'dudas' ? ' · reunión de dudas (15 min)' : ''}\n\n` +
         '¿Lo confirmo? Respondé *sí* o *no*, o pedime otro horario.';
 }
 
-async function crearPedidoTurno({ telefono, inicio, tipo, producto, motivo }) {
+// reemplazaId: reunión confirmada que se libera recién cuando el asesor confirme este nuevo horario.
+// cambioDe: texto del horario anterior, para el aviso al administrador.
+async function crearPedidoTurno({ telefono, inicio, tipo, producto, motivo, reemplazaId = null, cambioDe = null }) {
     const contacto = await obtenerContacto(telefono);
     const duracion = BLOQUE_MIN[tipo] || 45;
     const fin = new Date(inicio.getTime() + duracion * 60000);
     const { rows } = await db.query(
-        `INSERT INTO turnos (telefono, nombre, numero, producto, motivo, tipo, inicio, fin, estado, avisado_admin_en)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pendiente_admin', NOW()) RETURNING *`,
-        [telefono, contacto?.nombre || null, contacto?.numero || null, producto || null, motivo || null, tipo, inicio, fin]);
+        `INSERT INTO turnos (telefono, nombre, numero, producto, motivo, tipo, inicio, fin, estado, avisado_admin_en, reemplaza_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pendiente_admin', NOW(), $9) RETURNING *`,
+        [telefono, contacto?.nombre || null, contacto?.numero || null, producto || null, motivo || null, tipo, inicio, fin, reemplazaId]);
     const t = rows[0];
-    await enviarAAdmin(textoAvisoTurno(t));
+    await enviarAAdmin(textoAvisoTurno({ ...t, cambio_de: cambioDe }));
     return t;
+}
+
+// Reunión confirmada que este pedido reemplaza (si sigue vigente).
+async function turnoReemplazado(t) {
+    if (!t?.reemplaza_id) return null;
+    const v = await obtenerTurno(t.reemplaza_id);
+    return v && v.estado === 'confirmado' ? v : null;
 }
 
 // Confirma un turno: verifica que el horario siga libre, crea la reunión con Meet y avisa al cliente.
@@ -864,8 +895,10 @@ async function confirmarTurno(id) {
     if (!['pendiente_admin', 'propuesto'].includes(t.estado)) return { ok: false, mensaje: `El turno #${id} está ${t.estado}, no se puede confirmar.` };
     if (new Date(t.inicio) <= new Date()) return { ok: false, mensaje: `El horario del turno #${id} ya pasó.` };
 
-    const google = await ocupadoGoogle(new Date(t.inicio), new Date(t.fin));
+    const anterior = await turnoReemplazado(t);
+    let google = await ocupadoGoogle(new Date(t.inicio), new Date(t.fin));
     if (google === null) return { ok: false, mensaje: 'No pude leer la agenda de Google. Revisá que esté conectada.' };
+    if (anterior) google = await sinEventoPropio(google, anterior.id);
     if (google.length) return { ok: false, mensaje: `El horario del turno #${id} ya está ocupado en el calendario. Pedime ofrecerle otro.` };
 
     const evento = await crearEventoConMeet({
@@ -878,14 +911,20 @@ async function confirmarTurno(id) {
 
     const token = require('crypto').randomBytes(16).toString('hex');
     await actualizarTurno(t.id, { estado: 'confirmado', evento_id: evento.id, meet: evento.meet, token });
+    if (anterior) {
+        await cancelarTurno(anterior.id, { porCliente: true, silencioso: true });
+        await actualizarTurno(anterior.id, { estado: 'reprogramado' });
+    }
     const duracionTxt = t.tipo === 'dudas' ? '15 minutos' : '30 minutos';
     await enviarACliente(t.telefono,
+        (anterior ? `Listo, cambiamos su reunión del ${etiquetaTurno(anterior.inicio)}. ` : '') +
         `Su reunión quedó confirmada para el ${etiquetaTurno(t.inicio)} (${duracionTxt}), por Google Meet, con un asesor del Estudio.\n\n` +
         `📅 Para agregarla a su agenda: ${PUBLIC_URL}/agenda/${token}\n\n` +
         'El día anterior le preguntaremos si va a asistir, y 15 minutos antes de la reunión le enviaremos por aquí el link de Google Meet.' +
         (AVISO_GRABACION ? `\n\n${AVISO_GRABACION}` : ''));
     const feriado = nombreFeriado(partesBA(t.inicio).fecha);
     return { ok: true, mensaje: `Listo, confirmé el turno #${t.id} (${t.nombre || 'cliente'}, ${etiquetaTurno(t.inicio)}). Meet: ${evento.meet}` +
+        (anterior ? `\nLiberé su reunión anterior del ${etiquetaTurno(anterior.inicio)} (#${anterior.id}).` : '') +
         (feriado ? `\n\n⚠️ Ojo: ese día es feriado (${feriado}).` : '') };
 }
 
@@ -899,11 +938,14 @@ async function rechazarTurno(id) {
     if (!t) return { ok: false, mensaje: `No existe el turno #${id}.` };
     if (!['pendiente_admin', 'propuesto'].includes(t.estado)) return { ok: false, mensaje: `El turno #${id} está ${t.estado}.` };
     await actualizarTurno(t.id, { estado: 'rechazado' });
-    const libres = await horariosLibres({ tipo: t.tipo });
+    const anterior = await turnoReemplazado(t);
+    const libres = await horariosLibres({ tipo: t.tipo, excluirId: anterior?.id });
     const opciones = libres ? elegirOpciones(libres, t.tipo).filter(o => o.inicio.getTime() !== new Date(t.inicio).getTime()) : [];
+    if (opciones.length) await guardarOpcionesOfrecidas(t.telefono, opciones, t.tipo);
+    const mantiene = anterior ? ` Su reunión del ${etiquetaTurno(anterior.inicio)} se mantiene.` : '';
     const texto = opciones.length
-        ? `Disculpe, el asesor no tiene disponibilidad el ${etiquetaTurno(t.inicio)}. Le puedo ofrecer:\n\n${textoOpciones(opciones)}\n\n¿Alguno le resulta cómodo?`
-        : `Disculpe, el asesor no tiene disponibilidad el ${etiquetaTurno(t.inicio)}. En breve le propondremos un nuevo horario.`;
+        ? `Disculpe, el asesor no tiene disponibilidad el ${etiquetaTurno(t.inicio)}.${mantiene} ${anterior ? 'Si prefiere cambiarla, le' : 'Le'} puedo ofrecer:\n\n${textoOpciones(opciones)}\n\nIndíquenos el número de su preferencia.`
+        : `Disculpe, el asesor no tiene disponibilidad el ${etiquetaTurno(t.inicio)}.${mantiene}${anterior ? '' : ' En breve le propondremos un nuevo horario.'}`;
     await enviarACliente(t.telefono, texto);
     return { ok: true, mensaje: `Listo, rechacé el turno #${t.id} y le ${opciones.length ? 'ofrecí otros horarios' : 'avisé que le proponemos otro horario'} a ${t.nombre || 'el cliente'}.` };
 }
@@ -917,15 +959,19 @@ async function proponerHorario(id, fecha, hora) {
     const inicio = desdeBA(fecha, h);
     if (inicio <= new Date()) return { ok: false, mensaje: 'Ese horario ya pasó.' };
     const fin = new Date(inicio.getTime() + (BLOQUE_MIN[t.tipo] || 45) * 60000);
-    const google = await ocupadoGoogle(inicio, fin);
+    // Si se propone mover una reunión confirmada (o un pedido de cambio), la reunión vigente no cuenta como ocupada.
+    const vigente = t.estado === 'confirmado' ? t : await turnoReemplazado(t);
+    let google = await ocupadoGoogle(inicio, fin);
     if (google === null) return { ok: false, mensaje: 'No pude leer la agenda de Google.' };
-    if (google.length || (await ocupadoTurnos(inicio, fin, t.id)).length) return { ok: false, mensaje: `El ${etiquetaTurno(inicio)} ya está ocupado.` };
+    google = await sinEventoPropio(google, vigente?.id);
+    const otros = (await ocupadoTurnos(inicio, fin, t.id)).filter(([x, y]) => !(vigente && x === new Date(vigente.inicio).getTime() && y === new Date(vigente.fin).getTime()));
+    if (google.length || otros.length) return { ok: false, mensaje: `El ${etiquetaTurno(inicio)} ya está ocupado.` };
 
     if (['pendiente_admin', 'propuesto'].includes(t.estado)) await actualizarTurno(t.id, { estado: 'rechazado' });
     const { rows } = await db.query(
-        `INSERT INTO turnos (telefono, nombre, numero, producto, motivo, tipo, inicio, fin, estado)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'propuesto') RETURNING *`,
-        [t.telefono, t.nombre, t.numero, t.producto, t.motivo, t.tipo, inicio, fin]);
+        `INSERT INTO turnos (telefono, nombre, numero, producto, motivo, tipo, inicio, fin, estado, reemplaza_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'propuesto', $9) RETURNING *`,
+        [t.telefono, t.nombre, t.numero, t.producto, t.motivo, t.tipo, inicio, fin, vigente?.id || null]);
     await enviarACliente(t.telefono, `El asesor le propone reunirse el ${etiquetaTurno(inicio)} por Google Meet. ¿Le queda bien ese horario?`);
     const feriado = nombreFeriado(fecha);
     return { ok: true, mensaje: `Le propuse a ${t.nombre || 'el cliente'} el ${etiquetaTurno(inicio)} (turno #${rows[0].id}). Si acepta, se confirma solo.` +
@@ -1049,10 +1095,14 @@ function construirInstrucciones() {
         '8. Servicios del Estudio: constitución de sociedades, mantenimiento societario (balances, asambleas ordinarias y extraordinarias, cambio de autoridades y gerencias), transferencias y procesos de disolución y cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.\n' +
         '9. REUNIONES: cuando ya sepas el nombre y de qué se trata la consulta, ofrecé una reunión sin cargo de 30 minutos por Google Meet con un asesor del Estudio. ' +
         'Para ofrecer horarios usá SIEMPRE la herramienta consultar_horarios: nunca inventes días ni horas. Presentá las opciones numeradas y pedí que responda solo con el número (1, 2 o 3). ' +
-        'Cuando el cliente elija una (por número, día u hora), usá solicitar_turno indicando el número de esa opción en "opcion". Después decile que estás verificando la disponibilidad del asesor y que en breve le confirmás. ' +
+        'Cuando el cliente elija una opción de la lista, usá solicitar_turno con ese número en "opcion". ' +
+        'Si el cliente pide un día y hora concretos (por ejemplo "¿puede ser el miércoles a las 16:30?"), usá directamente solicitar_turno con "fecha" y "hora"; si no está libre, la herramienta te devuelve las opciones más cercanas para ofrecer. ' +
+        'Si pide solo un día ("¿tienen algo el jueves?") o solo una hora ("¿más tarde?", "¿a las 17?"), usá consultar_horarios con "fecha" y/o "hora". Si dice solo una hora y ya hay un turno o una propuesta para un día, se entiende que es ese mismo día. ' +
         'NUNCA digas que la reunión está confirmada: la confirmación la envía el sistema por separado.\n' +
         '10. Si el cliente tiene dudas sobre un presupuesto que ya recibió y no podés resolverlas, ofrecé una reunión de dudas de 15 minutos (tipo "dudas"), que tiene prioridad.\n' +
-        '11. Si el cliente tiene un turno y quiere confirmar asistencia, cancelarlo o responder a un horario que le propuso el asesor, usá las herramientas correspondientes. Para cambiar el horario de un turno: cancelalo y ofrecé horarios nuevos.' +
+        '11. Si el cliente tiene un turno y quiere confirmar asistencia, cancelarlo o responder a un horario que le propuso el asesor, usá las herramientas correspondientes. ' +
+        'Para CAMBIAR el horario NO lo canceles: usá solicitar_turno con el nuevo horario (se envía al asesor como pedido de cambio y la reunión actual se mantiene hasta que lo confirme). Si el asesor le propuso un horario y el cliente pide otro, también es solicitar_turno. Cancelá solo si el cliente pide cancelar sin querer otro horario.\n' +
+        '12. HONESTIDAD: nunca digas que enviaste, pediste, reservaste, cancelaste o confirmaste algo si la herramienta no devolvió "ok". Si devolvió un error, explicale al cliente con amabilidad lo que pasó y ofrecé la alternativa que indique la herramienta. Nunca inventes horarios ni prometas una respuesta del asesor que no se pidió.' +
         reglasAdmin;
 }
 
@@ -1060,24 +1110,26 @@ function construirInstrucciones() {
 const HERRAMIENTAS_CLIENTE = [
     {
         name: 'consultar_horarios',
-        description: 'Devuelve los próximos horarios libres para una reunión por Google Meet con un asesor del Estudio.',
+        description: 'Devuelve horarios libres para una reunión por Google Meet con un asesor del Estudio. Si el cliente menciona un día y/o una hora, pasalos para buscar ese horario o los más cercanos ese día. Sirve también para cambiar el horario de un turno que ya tiene.',
         parameters: {
             type: 'OBJECT',
             properties: {
-                tipo: { type: 'STRING', enum: ['consulta', 'dudas'], description: '"consulta" (30 min) o "dudas" sobre un presupuesto ya enviado (15 min, con prioridad).' }
+                tipo: { type: 'STRING', enum: ['consulta', 'dudas'], description: '"consulta" (30 min) o "dudas" sobre un presupuesto ya enviado (15 min, con prioridad).' },
+                fecha: { type: 'STRING', description: 'Día que pidió el cliente, AAAA-MM-DD (usá la fecha actual del contexto para calcularlo). Omitir si no pidió un día.' },
+                hora: { type: 'STRING', description: 'Hora que pidió el cliente, HH:MM en 24 hs (ej. "16:30"). Omitir si no pidió una hora.' }
             },
             required: ['tipo']
         }
     },
     {
         name: 'solicitar_turno',
-        description: 'Pide al asesor un turno en uno de los horarios ofrecidos. Queda pendiente hasta que el asesor lo confirme.',
+        description: 'Pide al asesor un turno: una opción de la lista o un día y hora que pidió el cliente. Si el cliente ya tiene un turno, funciona como pedido de CAMBIO de horario (no hace falta cancelar antes; la reunión actual se mantiene hasta que el asesor confirme la nueva). Queda pendiente hasta que el asesor lo confirme.',
         parameters: {
             type: 'OBJECT',
             properties: {
                 opcion: { type: 'INTEGER', description: 'Número de la opción que eligió el cliente (1, 2, 3...) de la última lista ofrecida. Es la forma preferida.' },
-                fecha: { type: 'STRING', description: 'Solo si el cliente pidió un horario que no está en la lista: fecha AAAA-MM-DD.' },
-                hora: { type: 'STRING', description: 'Solo si el cliente pidió un horario que no está en la lista: hora HH:MM (24 hs).' },
+                fecha: { type: 'STRING', description: 'Si el cliente pidió un día y hora concretos: fecha AAAA-MM-DD.' },
+                hora: { type: 'STRING', description: 'Si el cliente pidió un día y hora concretos: hora HH:MM (24 hs), por ejemplo "16:30".' },
                 tipo: { type: 'STRING', enum: ['consulta', 'dudas'] },
                 producto: { type: 'STRING', enum: ['SAS', 'SRL', 'SA', 'Otra consulta'], description: 'Producto o tema principal de la consulta.' },
                 motivo: { type: 'STRING', description: 'Resumen breve de la consulta del cliente.' }
@@ -1134,54 +1186,123 @@ async function leerOpcionesOfrecidas(telefono) {
     }
 }
 
-// Interpreta el horario elegido: por número de opción, o por fecha y hora (tolerando un año mal puesto).
-function resolverHorarioElegido(args, ofrecidas, libres) {
-    if (args.opcion && ofrecidas?.opciones?.[args.opcion - 1]) return new Date(ofrecidas.opciones[args.opcion - 1].inicio);
-    const hora = normalizarHora(args.hora);
-    if (!hora) return null;
-    const m = String(args.fecha || '').match(/(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})[\/-](\d{1,2})(?:[\/-](\d{2,4}))?/);
+// Interpreta una fecha que puede venir con el año mal puesto ("2020-10-14", "14/10", "14/10/25"): se usa el día y el mes,
+// y el año es el de la próxima vez que cae esa fecha.
+function interpretarFecha(texto) {
+    const m = String(texto || '').match(/(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})[\/-](\d{1,2})(?:[\/-](\d{2,4}))?/);
     if (!m) return null;
     const dia = Number(m[3] || m[4]), mes = Number(m[2] || m[5]);
-    const candidatos = [...(ofrecidas?.opciones || []).map(o => new Date(o.inicio)), ...(libres || []).map(l => l.inicio)];
-    return candidatos.find(c => { const p = partesBA(c); return p.dia === dia && p.mes === mes && p.hora === hora; }) || null;
+    if (!(dia >= 1 && dia <= 31 && mes >= 1 && mes <= 12)) return null;
+    const hoy = partesBA(Date.now()).fecha;
+    let anio = Number(hoy.slice(0, 4));
+    const armar = a => `${a}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
+    if (armar(anio) < hoy) anio += 1;
+    return armar(anio);
+}
+
+// Interpreta el horario elegido: por número de opción, o por fecha y hora (el año no importa).
+function resolverHorarioElegido(args, ofrecidas) {
+    if (args.opcion && ofrecidas?.opciones?.[args.opcion - 1]) return new Date(ofrecidas.opciones[args.opcion - 1].inicio);
+    const hora = normalizarHora(args.hora);
+    const fecha = interpretarFecha(args.fecha);
+    if (!hora || !fecha) return null;
+    return desdeBA(fecha, hora);
+}
+
+// Opciones cercanas a lo que pidió el cliente: ese día (lo más cerca posible de la hora pedida) o esa hora en otros días.
+function opcionesCercanas(libres, { fecha, hora }, cantidad = 3) {
+    let base = libres;
+    if (fecha) base = base.filter(l => l.fecha === fecha);
+    if (!base.length) return [];
+    if (hora) {
+        const objetivo = minutos(hora);
+        const dist = l => Math.abs(minutos(partesBA(l.inicio).hora) - objetivo);
+        if (!fecha) base = base.filter(l => dist(l) === 0);
+        base = [...base].sort((x, y) => dist(x) - dist(y) || x.inicio - y.inicio);
+    }
+    const elegidos = [];
+    for (const l of base) {
+        if (elegidos.length >= cantidad) break;
+        // dentro de un mismo día, opciones separadas al menos 30 minutos
+        if (elegidos.some(e => e.fecha === l.fecha && Math.abs(e.inicio - l.inicio) < 30 * 60000)) continue;
+        elegidos.push(l);
+    }
+    return elegidos.sort((x, y) => x.inicio - y.inicio);
+}
+
+function listaOpciones(opciones) {
+    return opciones.map((o, i) => ({ opcion: i + 1, texto: etiquetaTurno(o.inicio) }));
 }
 
 async function ejecutarHerramientaCliente(telefono, nombre, args) {
     try {
         if (nombre === 'consultar_horarios') {
             const tipo = args.tipo === 'dudas' ? 'dudas' : 'consulta';
-            const activo = await turnoActivoCliente(telefono);
-            if (activo) return { aviso: `El cliente ya tiene un turno ${activo.estado === 'confirmado' ? 'confirmado' : 'en trámite'} el ${etiquetaTurno(activo.inicio)}. Para otro horario hay que cancelar ese primero.` };
-            const libres = await horariosLibres({ tipo });
+            const activos = await turnosActivosCliente(telefono);
+            const vigente = activos.find(t => t.estado === 'confirmado') || null;
+            const fecha = args.fecha ? interpretarFecha(args.fecha) : null;
+            const hora = args.hora ? normalizarHora(args.hora) : null;
+            const especifico = Boolean(fecha || hora);
+            const libres = await horariosLibres({ tipo, excluirId: activos.map(t => t.id), paso: especifico ? 15 : PASO_MIN });
             if (!libres) return { error: 'La agenda no está disponible en este momento. Decile que un asesor lo contactará para coordinar.' };
-            const opciones = elegirOpciones(libres, tipo);
+            let opciones = especifico ? opcionesCercanas(libres, { fecha, hora }) : elegirOpciones(libres, tipo);
+            let nota = null;
+            if (especifico && !opciones.length) {
+                const feriado = fecha && nombreFeriado(fecha);
+                nota = `No hay horarios libres ${fecha ? `el ${etiquetaFecha(desdeBA(fecha, '12:00'))}` : `a las ${hora}`}${feriado ? ` (es feriado: ${feriado})` : ''}. Ofrecé estas otras opciones.`;
+                opciones = elegirOpciones(especifico ? await horariosLibres({ tipo, excluirId: activos.map(t => t.id) }) || [] : libres, tipo);
+            } else if (especifico && hora && fecha && !opciones.some(o => o.fecha === fecha && partesBA(o.inicio).hora === hora)) {
+                nota = `El ${etiquetaFecha(desdeBA(fecha, '12:00'))} a las ${hora} no está disponible; estas son las opciones más cercanas.`;
+            } else if (especifico && hora && fecha) {
+                nota = `El horario pedido está disponible (es la opción ${opciones.findIndex(o => partesBA(o.inicio).hora === hora) + 1}).`;
+            }
             if (!opciones.length) return { error: 'No hay horarios libres en los próximos días. Decile que un asesor lo contactará para coordinar.' };
             await guardarOpcionesOfrecidas(telefono, opciones, tipo);
-            return {
-                opciones: opciones.map((o, i) => ({ opcion: i + 1, texto: etiquetaTurno(o.inicio) })),
-                indicacion: 'Mostralas numeradas con el mismo número. Cuando el cliente elija, llamá a solicitar_turno con ese número en "opcion".'
-            };
+            const r = { opciones: listaOpciones(opciones), indicacion: 'Mostralas numeradas con el mismo número. Cuando el cliente elija, llamá a solicitar_turno con ese número en "opcion".' };
+            if (nota) r.nota = nota;
+            if (activos.length) r.cambio = `El cliente ya tiene un turno el ${etiquetaTurno(activos[0].inicio)}. Si elige una opción, solicitar_turno lo envía como pedido de cambio de horario${vigente ? ' (su reunión actual se mantiene hasta que el asesor confirme la nueva)' : ''}.`;
+            return r;
         }
 
         if (nombre === 'solicitar_turno') {
             const ofrecidas = await leerOpcionesOfrecidas(telefono);
             const tipo = args.tipo === 'dudas' ? 'dudas' : (ofrecidas?.tipo || 'consulta');
-            if (await turnoActivoCliente(telefono)) return { error: 'El cliente ya tiene un turno activo.' };
-            const libres = await horariosLibres({ tipo });
+            const activos = await turnosActivosCliente(telefono);
+            const vigente = activos.find(t => t.estado === 'confirmado') || null;
+            const enTramite = activos.filter(t => t.estado !== 'confirmado');
+            const libres = await horariosLibres({ tipo, excluirId: activos.map(t => t.id), paso: 15 });
             if (!libres) return { error: 'La agenda no está disponible. Decile que un asesor lo contactará.' };
-            const inicio = resolverHorarioElegido(args, ofrecidas, libres);
-            if (!inicio) return { error: 'No pude identificar el horario elegido. Pedile que indique el número de opción.' };
+            const inicio = resolverHorarioElegido(args, ofrecidas);
+            if (!inicio) return { error: 'No pude identificar el horario elegido. Pedile que indique el día y la hora, o el número de opción.' };
+            if (vigente && new Date(vigente.inicio).getTime() === inicio.getTime()) return { error: `Ese es el horario que ya tiene confirmado (${etiquetaTurno(inicio)}).` };
+            // Los turnos del propio cliente no le bloquean el nuevo pedido (se excluyeron al calcular los libres).
             if (!libres.some(l => l.inicio.getTime() === inicio.getTime())) {
-                const opciones = elegirOpciones(libres, tipo);
+                const fecha = partesBA(inicio).fecha;
+                let opciones = opcionesCercanas(libres.filter(l => l.inicio.getTime() !== inicio.getTime()), { fecha, hora: partesBA(inicio).hora });
+                if (!opciones.length) opciones = elegirOpciones(libres, tipo);
                 await guardarOpcionesOfrecidas(telefono, opciones, tipo);
                 return {
-                    error: `El horario ${etiquetaTurno(inicio)} ya no está disponible.`,
-                    opciones: opciones.map((o, i) => ({ opcion: i + 1, texto: etiquetaTurno(o.inicio) }))
+                    error: `El ${etiquetaTurno(inicio)} no está disponible. NO se envió ningún pedido.`,
+                    opciones: listaOpciones(opciones),
+                    indicacion: 'Decíselo con claridad y ofrecé estas opciones numeradas.'
                 };
             }
-            const t = await crearPedidoTurno({ telefono, inicio, tipo, producto: args.producto, motivo: args.motivo });
+            const anterior = enTramite[0] || vigente;
+            for (const t of enTramite) await actualizarTurno(t.id, { estado: t.estado === 'propuesto' ? 'rechazado_cliente' : 'reemplazado' });
+            const t = await crearPedidoTurno({
+                telefono, inicio, tipo,
+                producto: args.producto || anterior?.producto, motivo: args.motivo || anterior?.motivo,
+                reemplazaId: vigente?.id || null,
+                cambioDe: anterior ? `${etiquetaTurno(anterior.inicio)}${anterior.estado === 'confirmado' ? ', confirmada' : anterior.estado === 'propuesto' ? ', propuesto por vos' : ', pendiente'}` : null
+            });
             await borrarConfig(`opciones:${telefono}`).catch(() => {});
-            return { ok: true, estado: 'pendiente de confirmación del asesor', horario: etiquetaTurno(t.inicio) };
+            return {
+                ok: true, estado: 'pedido enviado al asesor, pendiente de confirmación', horario: etiquetaTurno(t.inicio),
+                mantiene: vigente ? etiquetaTurno(vigente.inicio) : null,
+                indicacion: vigente
+                    ? `Decile que enviaste el pedido de cambio al asesor y que su reunión del ${etiquetaTurno(vigente.inicio)} se mantiene hasta que se confirme la nueva.`
+                    : 'Decile que estás verificando la disponibilidad del asesor y que en breve le confirmás.'
+            };
         }
 
         if (nombre === 'confirmar_asistencia' || nombre === 'responder_asistencia') {
@@ -1195,10 +1316,10 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
         }
 
         if (nombre === 'cancelar_mi_turno') {
-            const t = await turnoActivoCliente(telefono);
-            if (!t) return { error: 'El cliente no tiene turnos activos.' };
-            const r = await cancelarTurno(t.id, { porCliente: true });
-            return r.ok ? { ok: true, horario_cancelado: etiquetaTurno(t.inicio) } : { error: r.mensaje };
+            const activos = await turnosActivosCliente(telefono);
+            if (!activos.length) return { error: 'El cliente no tiene turnos activos.' };
+            for (const t of activos) await cancelarTurno(t.id, { porCliente: true });
+            return { ok: true, cancelados: activos.map(t => etiquetaTurno(t.inicio)) };
         }
 
         if (nombre === 'responder_propuesta') {
@@ -1337,6 +1458,7 @@ async function eleccionDirecta(telefono, texto) {
         opcion: numero, tipo: ofrecidas.tipo, producto: detectarProducto(previos),
         motivo: previos.filter(p => p.length > 15).slice(-2).join(' / ').slice(0, 300) || null
     });
+    if (r.ok && r.mantiene) return `Perfecto. Le envié al asesor el pedido de cambio para el ${r.horario}. Su reunión del ${r.mantiene} se mantiene hasta que le confirmemos el nuevo horario.`;
     if (r.ok) return `Perfecto. Estoy verificando la disponibilidad del asesor para el ${r.horario}. En breve le confirmo.`;
     if (r.opciones) return `${r.error} Le puedo ofrecer:\n\n${r.opciones.map(o => `${o.opcion}. ${o.texto}`).join('\n')}\n\nIndíquenos el número de su preferencia.`;
     return null; // que lo resuelva la conversación normal
@@ -1358,9 +1480,12 @@ async function contextoCliente(telefono) {
                 (linkVisible && t.meet ? `. Link de la reunión: ${t.meet}` : '. El link de Meet se le envía automáticamente 15 minutos antes; no lo compartas ni lo inventes antes') + '.');
             if (t.estado === 'confirmado' && preguntas[t.flujo]) partes.push(preguntas[t.flujo]);
             else if (preguntaAsistenciaAbierta(t)) partes.push('El sistema le preguntó si va a asistir. Si responde sí o no (aunque sea con otras palabras), usá responder_asistencia. Nunca insistas ni presiones.');
+            const otros = (await turnosActivosCliente(telefono)).filter(x => x.id !== t.id);
+            for (const o of otros) partes.push(`Además tiene un pedido de cambio de horario al ${etiquetaTurno(o.inicio)}, ${estados[o.estado]}.`);
+            if (t.estado === 'propuesto') partes.push('Si acepta el horario propuesto usá responder_propuesta; si pide otro día u hora, usá solicitar_turno con ese día y hora (NO canceles).');
         }
         const ofrecidas = await leerOpcionesOfrecidas(telefono);
-        if (ofrecidas && !t) {
+        if (ofrecidas) {
             partes.push(`Opciones de horario ofrecidas a este cliente (si elige una, usá solicitar_turno con ese número en "opcion"):\n` +
                 ofrecidas.opciones.map((o, i) => `${i + 1}. ${o.texto}`).join('\n'));
         }
@@ -1871,7 +1996,11 @@ function normalizarTexto(t) {
 
 function esAfirmativo(t) {
     const n = normalizarTexto(t);
-    return n.length <= 30 && /^(si+|sip|sii|dale|ok|okey|okay|oka|confirmo|confirma|confirmalo|confirmar|de acuerdo|perfecto|listo|adelante|claro|obvio|va|hacelo|si dale|dale si|si confirmo|si confirmalo|si por favor|si gracias|dale gracias|ok dale|si si)( por favor| gracias)?$/.test(n);
+    if (n.length > 30) return false;
+    if (/^(si+|sip|sii|dale|ok|okey|okay|oka|confirmo|confirma|confirmalo|confirmar|de acuerdo|perfecto|listo|adelante|claro|obvio|va|hacelo|si dale|dale si|si confirmo|si confirmalo|si por favor|si gracias|dale gracias|ok dale|si si)( por favor| gracias)?$/.test(n)) return true;
+    // "si puede fijate", "sí, hacelo", "dale mandale": empieza con un sí y no trae condiciones, números ni negaciones.
+    return /^(si+|dale|ok|okey|listo|perfecto|claro|de acuerdo|confirmo)( |$)/.test(n) && !/\d/.test(n) &&
+        !/\b(no|pero|otro|otra|otros|otras|cambia|cambiale|mejor|aunque|salvo|excepto|despues|antes|tarde|temprano|manana|lunes|martes|miercoles|jueves|viernes|sabado|domingo|cuando|cual|que)\b/.test(n);
 }
 
 function esNegativo(t) {
@@ -2076,7 +2205,10 @@ async function revisarTareas() {
             const inicio = new Date(t.inicio).getTime();
             if (inicio - ahora < 60 * 60000) {
                 await actualizarTurno(t.id, { estado: 'vencido' });
-                await enviarACliente(t.telefono, `Disculpe, no pudimos confirmar a tiempo la reunión del ${etiquetaTurno(t.inicio)}. Si lo desea, le ofrezco nuevos horarios.`).catch(() => {});
+                const anterior = await turnoReemplazado(t);
+                await enviarACliente(t.telefono, anterior
+                    ? `Disculpe, no pudimos confirmar a tiempo el cambio al ${etiquetaTurno(t.inicio)}. Su reunión del ${etiquetaTurno(anterior.inicio)} se mantiene.`
+                    : `Disculpe, no pudimos confirmar a tiempo la reunión del ${etiquetaTurno(t.inicio)}. Si lo desea, le ofrezco nuevos horarios.`).catch(() => {});
                 await enviarAAdmin(`⌛ El pedido #${t.id} de ${t.nombre || 'un cliente'} (${etiquetaTurno(t.inicio)}) venció sin confirmación. Le avisé al cliente.`);
                 continue;
             }
@@ -2440,6 +2572,6 @@ module.exports = {
     partesBA, desdeBA, franjasDelDia, elegirOpciones, horariosLibres, esAfirmativo, esNegativo, etiquetaTurno,
     ejecutarHerramientaCliente, procesarMensajeAdmin, revisarTareas, conversarConHerramientas, confirmarTurno,
     inicializarDB, guardarConfig, consultarGemini, db, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
-    resumenDisponibilidad, avisarTurnosEnFeriados, textoRecordatorioCliente, esAfirmativoCliente, esNegativoCliente,
+    resumenDisponibilidad, avisarTurnosEnFeriados, rechazarTurno, proponerHorario, interpretarFecha, construirInstrucciones, textoRecordatorioCliente, esAfirmativoCliente, esNegativoCliente,
     _set: (k, v) => { if (k === 'socket') socketActual = v; if (k === 'conectado') isConnected = v; if (k === 'dbOk') dbOk = v; }
 };
