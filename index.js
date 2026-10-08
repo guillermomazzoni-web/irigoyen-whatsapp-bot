@@ -148,6 +148,39 @@ async function inicializarDB() {
                 actualizado_en TIMESTAMPTZ DEFAULT NOW()
             );
         `);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS excepciones_horario (
+                id SERIAL PRIMARY KEY,
+                fecha DATE NOT NULL,
+                desde TEXT,
+                hasta TEXT,
+                tipo TEXT NOT NULL,
+                creada_en TIMESTAMPTZ DEFAULT NOW()
+            );
+        `);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS turnos (
+                id SERIAL PRIMARY KEY,
+                telefono TEXT NOT NULL,
+                nombre TEXT,
+                numero TEXT,
+                producto TEXT,
+                motivo TEXT,
+                tipo TEXT NOT NULL DEFAULT 'consulta',
+                inicio TIMESTAMPTZ NOT NULL,
+                fin TIMESTAMPTZ NOT NULL,
+                estado TEXT NOT NULL,
+                evento_id TEXT,
+                meet TEXT,
+                asistencia_confirmada BOOLEAN DEFAULT FALSE,
+                avisado_admin_en TIMESTAMPTZ,
+                segundo_aviso BOOLEAN DEFAULT FALSE,
+                recordatorios JSONB DEFAULT '{}'::jsonb,
+                creado_en TIMESTAMPTZ DEFAULT NOW(),
+                actualizado_en TIMESTAMPTZ DEFAULT NOW()
+            );
+        `);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_turnos_estado ON turnos (estado, inicio)`);
         dbOk = true;
         console.log('✅ Base de datos inicializada correctamente.');
     } catch (e) {
@@ -449,6 +482,12 @@ app.get('/google/callback', async (req, res) => {
         return res.send(paginaSimple('No se conectó', 'Google no devolvió el permiso permanente. Pedí otro link e intentá de nuevo.', false));
     }
 
+    const permisos = String(r.json.scope || '');
+    if (!permisos.includes('https://www.googleapis.com/auth/calendar')) {
+        return res.send(paginaSimple('Falta el permiso de la agenda',
+            'Google conectó la cuenta pero sin acceso al calendario. Pedí otro link y, en la pantalla de permisos, marcá la casilla del calendario (o "Seleccionar todo").', false));
+    }
+
     const email = emailDesdeIdToken(r.json.id_token || '');
     if (email !== GOOGLE_CUENTA) {
         return res.send(paginaSimple('Cuenta incorrecta',
@@ -471,6 +510,393 @@ app.get('/google/callback', async (req, res) => {
     }
     res.send(paginaSimple('Google Calendar conectado', `El bot ya puede usar la agenda de ${email}. Podés cerrar esta página.`, true));
 });
+
+// ---------- Agenda y turnos ----------
+// Horario base: lunes a viernes de 12 a 18 hs. Cada turno bloquea 45 minutos (30 de reunión + 15 de margen);
+// las reuniones de dudas bloquean 30 (15 + 15). El administrador ajusta días puntuales con excepciones.
+
+const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+const HORARIO_BASE = { 1: [['12:00', '18:00']], 2: [['12:00', '18:00']], 3: [['12:00', '18:00']], 4: [['12:00', '18:00']], 5: [['12:00', '18:00']] };
+const BLOQUE_MIN = { consulta: 45, dudas: 30 };
+const PASO_MIN = 45;
+const ANTICIPACION_MIN = 180;       // no se ofrecen turnos con menos de 3 horas
+const DIAS_A_OFRECER = 10;
+const TOLERANCIA_PEGADO_MIN = 15;   // un turno a menos de 15 min de otra reunión cuenta como "pegado"
+const ESTADOS_OCUPAN = ['pendiente_admin', 'propuesto', 'confirmado'];
+const AVISO_GRABACION = (process.env.AVISO_GRABACION || '').trim();
+
+// Convierte una fecha a sus partes en hora de Buenos Aires (UTC-3, sin horario de verano).
+function partesBA(fecha) {
+    const d = new Date(new Date(fecha).getTime() - 3 * 60 * 60 * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    return {
+        fecha: `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`,
+        hora: `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`,
+        dow: d.getUTCDay(),
+        dia: d.getUTCDate(),
+        mes: d.getUTCMonth() + 1
+    };
+}
+
+function desdeBA(fecha, hora) {
+    return new Date(`${fecha}T${hora}:00-03:00`);
+}
+
+function sumarDiasFecha(fecha, dias) {
+    const d = new Date(`${fecha}T12:00:00-03:00`);
+    return partesBA(new Date(d.getTime() + dias * 86400000)).fecha;
+}
+
+function minutos(hora) {
+    const [h, m] = hora.split(':').map(Number);
+    return h * 60 + m;
+}
+
+function horaTexto(min) {
+    return `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+}
+
+function normalizarHora(valor) {
+    const m = String(valor || '').trim().match(/^(\d{1,2})(?::?(\d{2}))?/);
+    if (!m) return null;
+    const h = Number(m[1]), mi = Number(m[2] || 0);
+    if (h > 23 || mi > 59) return null;
+    return horaTexto(h * 60 + mi);
+}
+
+function etiquetaFecha(fecha) {
+    const p = partesBA(fecha);
+    return `${DIAS[p.dow]} ${String(p.dia).padStart(2, '0')}/${String(p.mes).padStart(2, '0')}`;
+}
+
+function etiquetaTurno(fecha) {
+    return `${etiquetaFecha(fecha)} a las ${partesBA(fecha).hora} hs`;
+}
+
+// Une intervalos [desde, hasta] en minutos.
+function unirIntervalos(lista) {
+    const ord = lista.filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0]);
+    const res = [];
+    for (const [a, b] of ord) {
+        const u = res[res.length - 1];
+        if (u && a <= u[1]) u[1] = Math.max(u[1], b); else res.push([a, b]);
+    }
+    return res;
+}
+
+function restarIntervalo(lista, [a, b]) {
+    const res = [];
+    for (const [x, y] of lista) {
+        if (b <= x || a >= y) { res.push([x, y]); continue; }
+        if (a > x) res.push([x, a]);
+        if (b < y) res.push([b, y]);
+    }
+    return res;
+}
+
+// Franjas de atención de un día (en minutos), aplicando las excepciones cargadas por el administrador.
+function franjasDelDia(fecha, excepciones) {
+    const dow = partesBA(desdeBA(fecha, '12:00')).dow;
+    let franjas = (HORARIO_BASE[dow] || []).map(([a, b]) => [minutos(a), minutos(b)]);
+    for (const e of excepciones.filter(x => x.fecha === fecha && x.tipo === 'abrir')) {
+        franjas.push([minutos(e.desde), minutos(e.hasta)]);
+    }
+    franjas = unirIntervalos(franjas);
+    for (const e of excepciones.filter(x => x.fecha === fecha && x.tipo === 'bloquear')) {
+        const rango = e.desde && e.hasta ? [minutos(e.desde), minutos(e.hasta)] : [0, 24 * 60];
+        franjas = restarIntervalo(franjas, rango);
+    }
+    return franjas;
+}
+
+async function cargarExcepciones(desdeFecha, hastaFecha) {
+    try {
+        const { rows } = await db.query(
+            `SELECT id, to_char(fecha, 'YYYY-MM-DD') AS fecha, desde, hasta, tipo FROM excepciones_horario
+             WHERE fecha BETWEEN $1 AND $2 ORDER BY fecha, id`, [desdeFecha, hastaFecha]);
+        return rows;
+    } catch (e) {
+        console.error('Error leyendo excepciones:', e.message);
+        return [];
+    }
+}
+
+async function ocupadoGoogle(desde, hasta) {
+    const r = await apiCalendar('POST', '/freeBusy', {
+        timeMin: desde.toISOString(),
+        timeMax: hasta.toISOString(),
+        timeZone: ZONA_HORARIA,
+        items: [{ id: 'primary' }]
+    });
+    if (r.status !== 200) return null;
+    return (r.json.calendars?.primary?.busy || []).map(b => [new Date(b.start).getTime(), new Date(b.end).getTime()]);
+}
+
+async function ocupadoTurnos(desde, hasta, excluirId = null) {
+    try {
+        const { rows } = await db.query(
+            `SELECT id, inicio, fin FROM turnos WHERE estado = ANY($1) AND fin > $2 AND inicio < $3`,
+            [ESTADOS_OCUPAN, desde, hasta]);
+        return rows.filter(t => t.id !== excluirId).map(t => [new Date(t.inicio).getTime(), new Date(t.fin).getTime()]);
+    } catch (e) {
+        return [];
+    }
+}
+
+// Devuelve los horarios libres de los próximos días, o null si no se pudo leer la agenda.
+async function horariosLibres({ tipo = 'consulta', dias = DIAS_A_OFRECER, excluirId = null } = {}) {
+    const ahora = Date.now();
+    const hoy = partesBA(ahora).fecha;
+    const ultimo = sumarDiasFecha(hoy, dias);
+    const desde = new Date(ahora);
+    const hasta = desdeBA(ultimo, '23:59');
+
+    const google = await ocupadoGoogle(desde, hasta);
+    if (!google) return null;
+    const ocupado = [...google, ...(await ocupadoTurnos(desde, hasta, excluirId))];
+    const excepciones = await cargarExcepciones(hoy, ultimo);
+    const duracion = BLOQUE_MIN[tipo] || 45;
+    const libres = [];
+
+    for (let i = 0; i <= dias; i++) {
+        const fecha = sumarDiasFecha(hoy, i);
+        for (const [a, b] of franjasDelDia(fecha, excepciones)) {
+            for (let m = a; m + duracion <= b; m += PASO_MIN) {
+                const inicio = desdeBA(fecha, horaTexto(m)).getTime();
+                const fin = inicio + duracion * 60000;
+                if (inicio < ahora + ANTICIPACION_MIN * 60000) continue;
+                if (ocupado.some(([x, y]) => inicio < y && fin > x)) continue;
+                const tol = TOLERANCIA_PEGADO_MIN * 60000;
+                const pegado = ocupado.some(([x, y]) => inicio < y + tol && fin + tol > x);
+                libres.push({ inicio: new Date(inicio), fin: new Date(fin), fecha, pegado });
+            }
+        }
+    }
+    return libres;
+}
+
+// Elige qué horarios ofrecer: para consultas, primero los que no quedan pegados a otra reunión y repartidos en
+// distintos días; para dudas, los más cercanos.
+function elegirOpciones(libres, tipo = 'consulta', cantidad = 3) {
+    if (tipo === 'dudas') return libres.slice(0, cantidad);
+    const sueltos = libres.filter(l => !l.pegado);
+    const base = sueltos.length ? sueltos : libres;
+    const elegidos = [];
+    const diasUsados = new Set();
+    for (const l of base) {
+        if (elegidos.length >= cantidad) break;
+        if (!diasUsados.has(l.fecha)) { elegidos.push(l); diasUsados.add(l.fecha); }
+    }
+    for (const l of base) {
+        if (elegidos.length >= cantidad) break;
+        if (!elegidos.includes(l)) elegidos.push(l);
+    }
+    return elegidos.sort((x, y) => x.inicio - y.inicio);
+}
+
+async function obtenerTurno(id) {
+    const { rows } = await db.query('SELECT * FROM turnos WHERE id = $1', [id]);
+    return rows[0] || null;
+}
+
+async function turnoActivoCliente(telefono) {
+    const { rows } = await db.query(
+        `SELECT * FROM turnos WHERE telefono = $1 AND estado = ANY($2) AND fin > NOW() ORDER BY inicio LIMIT 1`,
+        [telefono, ESTADOS_OCUPAN]);
+    return rows[0] || null;
+}
+
+async function turnosPendientesAdmin() {
+    const { rows } = await db.query(`SELECT * FROM turnos WHERE estado = 'pendiente_admin' AND inicio > NOW() ORDER BY creado_en`);
+    return rows;
+}
+
+async function actualizarTurno(id, campos) {
+    const claves = Object.keys(campos);
+    const sets = claves.map((k, i) => `${k} = $${i + 2}`).join(', ');
+    await db.query(`UPDATE turnos SET ${sets}, actualizado_en = NOW() WHERE id = $1`, [id, ...claves.map(k => campos[k])]);
+}
+
+function descripcionTurno(t) {
+    return `#${t.id} · ${t.nombre || 'Sin nombre'} · ${t.producto || 'Consulta'} · ${etiquetaTurno(t.inicio)}${t.tipo === 'dudas' ? ' (dudas de presupuesto)' : ''}`;
+}
+
+// Mensajes que el sistema manda por su cuenta: quedan guardados en el historial del cliente.
+async function enviarACliente(telefono, texto) {
+    if (!socketActual) throw new Error('WhatsApp no está conectado');
+    await socketActual.sendMessage(telefono, { text: texto });
+    await guardarMensaje(telefono, 'bot', texto);
+    userHistories.delete(telefono); // se recarga desde la base en el próximo mensaje
+}
+
+async function enviarAAdmin(texto) {
+    if (!socketActual || !ADMIN_NUMBER) return;
+    try {
+        await socketActual.sendMessage(await obtenerJidAdmin(socketActual), { text: texto });
+    } catch (e) {
+        console.error('Error enviando mensaje al administrador:', e.message);
+    }
+}
+
+function textoAvisoTurno(t, segundo = false) {
+    return `${segundo ? '🔔 *Segundo aviso* — sigue pendiente\n\n' : ''}📅 *Pedido de turno #${t.id}*\n\n` +
+        `👤 ${t.nombre || 'Sin nombre'}${t.numero ? ` (+${t.numero})` : ''}\n` +
+        `📝 ${t.producto || 'Consulta'}${t.motivo ? `: ${t.motivo}` : ''}\n` +
+        `🕒 ${etiquetaTurno(t.inicio)}${t.tipo === 'dudas' ? ' · reunión de dudas (15 min)' : ''}\n\n` +
+        '¿Lo confirmo? Respondé *sí* o *no*, o pedime otro horario.';
+}
+
+async function crearPedidoTurno({ telefono, inicio, tipo, producto, motivo }) {
+    const contacto = await obtenerContacto(telefono);
+    const duracion = BLOQUE_MIN[tipo] || 45;
+    const fin = new Date(inicio.getTime() + duracion * 60000);
+    const { rows } = await db.query(
+        `INSERT INTO turnos (telefono, nombre, numero, producto, motivo, tipo, inicio, fin, estado, avisado_admin_en)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pendiente_admin', NOW()) RETURNING *`,
+        [telefono, contacto?.nombre || null, contacto?.numero || null, producto || null, motivo || null, tipo, inicio, fin]);
+    const t = rows[0];
+    await enviarAAdmin(textoAvisoTurno(t));
+    return t;
+}
+
+// Confirma un turno: verifica que el horario siga libre, crea la reunión con Meet y avisa al cliente.
+async function confirmarTurno(id) {
+    const t = await obtenerTurno(id);
+    if (!t) return { ok: false, mensaje: `No existe el turno #${id}.` };
+    if (!['pendiente_admin', 'propuesto'].includes(t.estado)) return { ok: false, mensaje: `El turno #${id} está ${t.estado}, no se puede confirmar.` };
+    if (new Date(t.inicio) <= new Date()) return { ok: false, mensaje: `El horario del turno #${id} ya pasó.` };
+
+    const google = await ocupadoGoogle(new Date(t.inicio), new Date(t.fin));
+    if (google === null) return { ok: false, mensaje: 'No pude leer la agenda de Google. Revisá que esté conectada.' };
+    if (google.length) return { ok: false, mensaje: `El horario del turno #${id} ya está ocupado en el calendario. Pedime ofrecerle otro.` };
+
+    const evento = await crearEventoConMeet({
+        titulo: `${t.tipo === 'dudas' ? 'Dudas de presupuesto' : 'Consulta'} ${t.producto || ''} – ${t.nombre || 'Cliente'}`.replace(/\s+/g, ' '),
+        descripcion: `WhatsApp: ${t.numero ? '+' + t.numero : t.telefono}\nProducto: ${t.producto || '-'}\nMotivo: ${t.motivo || '-'}\nTurno #${t.id} (agendado por el bot)`,
+        inicio: new Date(t.inicio).toISOString(),
+        fin: new Date(t.fin).toISOString()
+    });
+    if (!evento) return { ok: false, mensaje: 'No se pudo crear la reunión en Google Calendar.' };
+
+    await actualizarTurno(t.id, { estado: 'confirmado', evento_id: evento.id, meet: evento.meet });
+    const duracionTxt = t.tipo === 'dudas' ? '15 minutos' : '30 minutos';
+    await enviarACliente(t.telefono,
+        `Su reunión quedó confirmada para el ${etiquetaTurno(t.inicio)} (${duracionTxt}), por Google Meet.\n\n` +
+        `Link de la reunión: ${evento.meet}\n\nUn asesor del Estudio lo atenderá. Le enviaremos recordatorios antes del encuentro.` +
+        (AVISO_GRABACION ? `\n\n${AVISO_GRABACION}` : ''));
+    return { ok: true, mensaje: `Listo, confirmé el turno #${t.id} (${t.nombre || 'cliente'}, ${etiquetaTurno(t.inicio)}). Meet: ${evento.meet}` };
+}
+
+function textoOpciones(opciones) {
+    return opciones.map((o, i) => `${i + 1}. ${etiquetaTurno(o.inicio)}`).join('\n');
+}
+
+// Rechaza un turno pendiente y le ofrece al cliente otros horarios.
+async function rechazarTurno(id) {
+    const t = await obtenerTurno(id);
+    if (!t) return { ok: false, mensaje: `No existe el turno #${id}.` };
+    if (!['pendiente_admin', 'propuesto'].includes(t.estado)) return { ok: false, mensaje: `El turno #${id} está ${t.estado}.` };
+    await actualizarTurno(t.id, { estado: 'rechazado' });
+    const libres = await horariosLibres({ tipo: t.tipo });
+    const opciones = libres ? elegirOpciones(libres, t.tipo).filter(o => o.inicio.getTime() !== new Date(t.inicio).getTime()) : [];
+    const texto = opciones.length
+        ? `Disculpe, el asesor no tiene disponibilidad el ${etiquetaTurno(t.inicio)}. Le puedo ofrecer:\n\n${textoOpciones(opciones)}\n\n¿Alguno le resulta cómodo?`
+        : `Disculpe, el asesor no tiene disponibilidad el ${etiquetaTurno(t.inicio)}. En breve le propondremos un nuevo horario.`;
+    await enviarACliente(t.telefono, texto);
+    return { ok: true, mensaje: `Listo, rechacé el turno #${t.id} y le ${opciones.length ? 'ofrecí otros horarios' : 'avisé que le proponemos otro horario'} a ${t.nombre || 'el cliente'}.` };
+}
+
+// El administrador propone otro horario: queda pre aprobado y se confirma solo si el cliente acepta.
+async function proponerHorario(id, fecha, hora) {
+    const t = await obtenerTurno(id);
+    if (!t) return { ok: false, mensaje: `No existe el turno #${id}.` };
+    const h = normalizarHora(hora);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha || '') || !h) return { ok: false, mensaje: 'No entendí la fecha u hora propuesta.' };
+    const inicio = desdeBA(fecha, h);
+    if (inicio <= new Date()) return { ok: false, mensaje: 'Ese horario ya pasó.' };
+    const fin = new Date(inicio.getTime() + (BLOQUE_MIN[t.tipo] || 45) * 60000);
+    const google = await ocupadoGoogle(inicio, fin);
+    if (google === null) return { ok: false, mensaje: 'No pude leer la agenda de Google.' };
+    if (google.length || (await ocupadoTurnos(inicio, fin, t.id)).length) return { ok: false, mensaje: `El ${etiquetaTurno(inicio)} ya está ocupado.` };
+
+    if (['pendiente_admin', 'propuesto'].includes(t.estado)) await actualizarTurno(t.id, { estado: 'rechazado' });
+    const { rows } = await db.query(
+        `INSERT INTO turnos (telefono, nombre, numero, producto, motivo, tipo, inicio, fin, estado)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'propuesto') RETURNING *`,
+        [t.telefono, t.nombre, t.numero, t.producto, t.motivo, t.tipo, inicio, fin]);
+    await enviarACliente(t.telefono, `El asesor le propone reunirse el ${etiquetaTurno(inicio)} por Google Meet. ¿Le queda bien ese horario?`);
+    return { ok: true, mensaje: `Le propuse a ${t.nombre || 'el cliente'} el ${etiquetaTurno(inicio)} (turno #${rows[0].id}). Si acepta, se confirma solo.` };
+}
+
+async function cancelarTurno(id, { porCliente = false } = {}) {
+    const t = await obtenerTurno(id);
+    if (!t) return { ok: false, mensaje: `No existe el turno #${id}.` };
+    if (!ESTADOS_OCUPAN.includes(t.estado)) return { ok: false, mensaje: `El turno #${id} ya estaba ${t.estado}.` };
+    if (t.evento_id) {
+        const r = await apiCalendar('DELETE', `/calendars/primary/events/${encodeURIComponent(t.evento_id)}?sendUpdates=none`);
+        if (![200, 204, 404, 410].includes(r.status)) console.error('No se pudo borrar el evento:', r.status, r.texto.slice(0, 200));
+    }
+    await actualizarTurno(t.id, { estado: porCliente ? 'cancelado_cliente' : 'cancelado' });
+    if (porCliente) {
+        await enviarAAdmin(`❌ ${t.nombre || 'Un cliente'} canceló su turno del ${etiquetaTurno(t.inicio)} (#${t.id}).`);
+    } else {
+        await enviarACliente(t.telefono, `Le informamos que la reunión del ${etiquetaTurno(t.inicio)} fue cancelada. Si lo desea, coordinamos un nuevo horario.`);
+    }
+    return { ok: true, mensaje: `Cancelé el turno #${t.id} (${t.nombre || 'cliente'}, ${etiquetaTurno(t.inicio)})${porCliente ? '' : ' y le avisé al cliente'}.` };
+}
+
+async function agregarExcepcion(tipo, fecha, desde, hasta) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha || '')) return { ok: false, mensaje: 'No entendí la fecha.' };
+    const d = desde ? normalizarHora(desde) : null;
+    const h = hasta ? normalizarHora(hasta) : null;
+    if (tipo === 'abrir' && (!d || !h)) return { ok: false, mensaje: 'Para abrir un horario necesito desde qué hora y hasta qué hora.' };
+    if (d && h && minutos(h) <= minutos(d)) return { ok: false, mensaje: 'La hora de fin tiene que ser posterior a la de inicio.' };
+    await db.query('INSERT INTO excepciones_horario (fecha, desde, hasta, tipo) VALUES ($1, $2, $3, $4)', [fecha, d, h, tipo]);
+    const fechaTxt = etiquetaFecha(desdeBA(fecha, '12:00'));
+    const rango = d && h ? ` de ${d} a ${h}` : '';
+    let aviso = '';
+    if (tipo === 'bloquear') {
+        const inicioRango = desdeBA(fecha, d || '00:00');
+        const finRango = desdeBA(fecha, h || '23:59');
+        const { rows } = await db.query(
+            `SELECT * FROM turnos WHERE estado = 'confirmado' AND inicio < $2 AND fin > $1`, [inicioRango, finRango]);
+        if (rows.length) aviso = `\n\n⚠️ Ojo: en ese rango ya hay ${rows.length === 1 ? 'una reunión confirmada' : `${rows.length} reuniones confirmadas`}: ${rows.map(descripcionTurno).join('; ')}. No las cancelé.`;
+    }
+    return { ok: true, mensaje: `Listo, ${tipo === 'bloquear' ? 'bloqueé' : 'abrí'} el ${fechaTxt}${rango}.${aviso}` };
+}
+
+async function restablecerDia(fecha) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha || '')) return { ok: false, mensaje: 'No entendí la fecha.' };
+    const r = await db.query('DELETE FROM excepciones_horario WHERE fecha = $1', [fecha]);
+    return { ok: true, mensaje: `El ${etiquetaFecha(desdeBA(fecha, '12:00'))} volvió al horario normal${r.rowCount ? '' : ' (no tenía cambios)'}.` };
+}
+
+async function resumenDisponibilidad(dias = 7) {
+    const hoy = partesBA(Date.now()).fecha;
+    const excepciones = await cargarExcepciones(hoy, sumarDiasFecha(hoy, dias));
+    const lineas = [];
+    for (let i = 0; i < dias; i++) {
+        const fecha = sumarDiasFecha(hoy, i);
+        const franjas = franjasDelDia(fecha, excepciones);
+        const tieneCambios = excepciones.some(e => e.fecha === fecha);
+        const txt = franjas.length ? franjas.map(([a, b]) => `${horaTexto(a)} a ${horaTexto(b)}`).join(' y ') : 'cerrado';
+        lineas.push(`• ${etiquetaFecha(desdeBA(fecha, '12:00'))}: ${txt}${tieneCambios ? ' (modificado)' : ''}`);
+    }
+    return lineas.join('\n');
+}
+
+async function resumenAgenda(dias = 7) {
+    const eventos = await eventosProximos(dias);
+    const { rows: pendientes } = await db.query(
+        `SELECT * FROM turnos WHERE estado IN ('pendiente_admin', 'propuesto') AND inicio > NOW() ORDER BY inicio`);
+    let txt = eventos === null
+        ? 'No pude leer Google Calendar.'
+        : (eventos.length ? eventos.map(e => `• ${horaCorta(e.start.dateTime || e.start.date)}: ${e.summary || '(sin título)'}`).join('\n') : 'No hay reuniones en el calendario.');
+    if (pendientes.length) {
+        txt += `\n\nPendientes:\n${pendientes.map(t => `• ${descripcionTurno(t)} (${t.estado === 'propuesto' ? 'esperando respuesta del cliente' : 'esperando tu confirmación'})`).join('\n')}`;
+    }
+    return txt;
+}
 
 // ---------- Reglas del administrador (guardadas en la base) ----------
 
@@ -510,8 +936,139 @@ function construirInstrucciones() {
         '5. Nunca prometas que lo va a atender un abogado: decí siempre "un asesor del Estudio".\n' +
         '6. Si preguntan precios exactos o trámites complejos, respondé formalmente que un asesor del Estudio se comunicará a la brevedad para asesorarlo en detalle, y solicitá su correo electrónico si aún no lo indicó.\n' +
         '7. Sé conciso: máximo 2 a 3 oraciones breves. Estás respondiendo por WhatsApp.\n' +
-        '8. Servicios del Estudio: constitución de sociedades, mantenimiento societario (balances, asambleas ordinarias y extraordinarias, cambio de autoridades y gerencias), transferencias y procesos de disolución y cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.' +
+        '8. Servicios del Estudio: constitución de sociedades, mantenimiento societario (balances, asambleas ordinarias y extraordinarias, cambio de autoridades y gerencias), transferencias y procesos de disolución y cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.\n' +
+        '9. REUNIONES: cuando ya sepas el nombre y de qué se trata la consulta, ofrecé una reunión sin cargo de 30 minutos por Google Meet con un asesor del Estudio. ' +
+        'Para ofrecer horarios usá SIEMPRE la herramienta consultar_horarios: nunca inventes días ni horas. Presentá las opciones numeradas. ' +
+        'Cuando el cliente elija una, usá solicitar_turno con la fecha y hora exactas de esa opción. Después decile que estás verificando la disponibilidad del asesor y que en breve le confirmás. ' +
+        'NUNCA digas que la reunión está confirmada: la confirmación la envía el sistema por separado.\n' +
+        '10. Si el cliente tiene dudas sobre un presupuesto que ya recibió y no podés resolverlas, ofrecé una reunión de dudas de 15 minutos (tipo "dudas"), que tiene prioridad.\n' +
+        '11. Si el cliente tiene un turno y quiere confirmar asistencia, cancelarlo o responder a un horario que le propuso el asesor, usá las herramientas correspondientes. Para cambiar el horario de un turno: cancelalo y ofrecé horarios nuevos.' +
         reglasAdmin;
+}
+
+// Herramientas que puede usar el bot cuando habla con clientes.
+const HERRAMIENTAS_CLIENTE = [
+    {
+        name: 'consultar_horarios',
+        description: 'Devuelve los próximos horarios libres para una reunión por Google Meet con un asesor del Estudio.',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                tipo: { type: 'STRING', enum: ['consulta', 'dudas'], description: '"consulta" (30 min) o "dudas" sobre un presupuesto ya enviado (15 min, con prioridad).' }
+            },
+            required: ['tipo']
+        }
+    },
+    {
+        name: 'solicitar_turno',
+        description: 'Pide al asesor un turno en uno de los horarios ofrecidos. Queda pendiente hasta que el asesor lo confirme.',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                fecha: { type: 'STRING', description: 'Fecha del horario elegido, formato AAAA-MM-DD.' },
+                hora: { type: 'STRING', description: 'Hora del horario elegido, formato HH:MM (24 hs).' },
+                tipo: { type: 'STRING', enum: ['consulta', 'dudas'] },
+                producto: { type: 'STRING', enum: ['SAS', 'SRL', 'SA', 'Otra consulta'], description: 'Producto o tema principal de la consulta.' },
+                motivo: { type: 'STRING', description: 'Resumen breve de la consulta del cliente.' }
+            },
+            required: ['fecha', 'hora', 'tipo', 'producto']
+        }
+    },
+    {
+        name: 'confirmar_asistencia',
+        description: 'Registra que el cliente confirmó que va a asistir a su reunión.',
+        parameters: { type: 'OBJECT', properties: {} }
+    },
+    {
+        name: 'cancelar_mi_turno',
+        description: 'Cancela el turno activo del cliente, cuando el cliente lo pide expresamente.',
+        parameters: { type: 'OBJECT', properties: {} }
+    },
+    {
+        name: 'responder_propuesta',
+        description: 'Respuesta del cliente al horario alternativo que le propuso el asesor.',
+        parameters: {
+            type: 'OBJECT',
+            properties: { acepta: { type: 'BOOLEAN', description: 'true si acepta el horario propuesto.' } },
+            required: ['acepta']
+        }
+    }
+];
+
+async function ejecutarHerramientaCliente(telefono, nombre, args) {
+    try {
+        if (nombre === 'consultar_horarios') {
+            const tipo = args.tipo === 'dudas' ? 'dudas' : 'consulta';
+            const activo = await turnoActivoCliente(telefono);
+            if (activo) return { aviso: `El cliente ya tiene un turno ${activo.estado === 'confirmado' ? 'confirmado' : 'en trámite'} el ${etiquetaTurno(activo.inicio)}. Para otro horario hay que cancelar ese primero.` };
+            const libres = await horariosLibres({ tipo });
+            if (!libres) return { error: 'La agenda no está disponible en este momento. Decile que un asesor lo contactará para coordinar.' };
+            const opciones = elegirOpciones(libres, tipo);
+            if (!opciones.length) return { error: 'No hay horarios libres en los próximos días. Decile que un asesor lo contactará para coordinar.' };
+            return { opciones: opciones.map(o => ({ fecha: o.fecha, hora: partesBA(o.inicio).hora, texto: etiquetaTurno(o.inicio) })) };
+        }
+
+        if (nombre === 'solicitar_turno') {
+            const tipo = args.tipo === 'dudas' ? 'dudas' : 'consulta';
+            const hora = normalizarHora(args.hora);
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(args.fecha || '') || !hora) return { error: 'Fecha u hora inválida.' };
+            if (await turnoActivoCliente(telefono)) return { error: 'El cliente ya tiene un turno activo.' };
+            const inicio = desdeBA(args.fecha, hora);
+            const libres = await horariosLibres({ tipo });
+            if (!libres) return { error: 'La agenda no está disponible. Decile que un asesor lo contactará.' };
+            if (!libres.some(l => l.inicio.getTime() === inicio.getTime())) {
+                const opciones = elegirOpciones(libres, tipo);
+                return { error: 'Ese horario ya no está disponible.', opciones: opciones.map(o => ({ fecha: o.fecha, hora: partesBA(o.inicio).hora, texto: etiquetaTurno(o.inicio) })) };
+            }
+            const t = await crearPedidoTurno({ telefono, inicio, tipo, producto: args.producto, motivo: args.motivo });
+            return { ok: true, estado: 'pendiente de confirmación del asesor', horario: etiquetaTurno(t.inicio) };
+        }
+
+        if (nombre === 'confirmar_asistencia') {
+            const t = await turnoActivoCliente(telefono);
+            if (!t || t.estado !== 'confirmado') return { error: 'El cliente no tiene una reunión confirmada.' };
+            await actualizarTurno(t.id, { asistencia_confirmada: true });
+            return { ok: true, horario: etiquetaTurno(t.inicio) };
+        }
+
+        if (nombre === 'cancelar_mi_turno') {
+            const t = await turnoActivoCliente(telefono);
+            if (!t) return { error: 'El cliente no tiene turnos activos.' };
+            const r = await cancelarTurno(t.id, { porCliente: true });
+            return r.ok ? { ok: true, horario_cancelado: etiquetaTurno(t.inicio) } : { error: r.mensaje };
+        }
+
+        if (nombre === 'responder_propuesta') {
+            const { rows } = await db.query(
+                `SELECT * FROM turnos WHERE telefono = $1 AND estado = 'propuesto' AND inicio > NOW() ORDER BY creado_en DESC LIMIT 1`, [telefono]);
+            const t = rows[0];
+            if (!t) return { error: 'No hay ningún horario propuesto pendiente.' };
+            if (!args.acepta) {
+                await actualizarTurno(t.id, { estado: 'rechazado_cliente' });
+                await enviarAAdmin(`ℹ️ ${t.nombre || 'El cliente'} no aceptó el horario propuesto (${etiquetaTurno(t.inicio)}). Le voy a ofrecer otros.`);
+                return { ok: true, siguiente: 'Ofrecele otros horarios con consultar_horarios.' };
+            }
+            const r = await confirmarTurno(t.id);
+            if (r.ok) await enviarAAdmin(`✅ ${t.nombre || 'El cliente'} aceptó el ${etiquetaTurno(t.inicio)}. Quedó confirmado.`);
+            return r.ok ? { ok: true, confirmado: true, aviso: 'El sistema ya le envió la confirmación con el link. No repitas el link.' } : { error: r.mensaje };
+        }
+    } catch (e) {
+        console.error(`Error en herramienta ${nombre}:`, e.message);
+        return { error: 'Error interno. Decile que un asesor lo contactará.' };
+    }
+    return { error: 'Herramienta desconocida.' };
+}
+
+async function contextoCliente(telefono) {
+    const partes = [`Fecha y hora actual en Buenos Aires: ${etiquetaTurno(new Date())}.`];
+    try {
+        const t = await turnoActivoCliente(telefono);
+        if (t) {
+            const estados = { pendiente_admin: 'pendiente de confirmación del asesor', propuesto: 'propuesto por el asesor, esperando respuesta del cliente', confirmado: 'confirmado' };
+            partes.push(`Este cliente tiene un turno ${estados[t.estado]}: ${etiquetaTurno(t.inicio)}${t.meet ? `, link ${t.meet}` : ''}${t.asistencia_confirmada ? ', asistencia confirmada' : ''}.`);
+        }
+    } catch (e) { /* sin contexto de turnos */ }
+    return partes.join('\n');
 }
 
 // ---------- Servidor web ----------
@@ -590,10 +1147,11 @@ app.get('/', (req, res) => {
 const CODIGOS_REINTENTABLES = new Set([429, 500, 502, 503, 504]);
 let ultimoErrorGemini = null;
 
-function llamarModelo(modelo, contents, generationConfig) {
+// Llama a un modelo con un cuerpo completo de Gemini. Devuelve { contenido, texto } o un error.
+function llamarModeloCuerpo(modelo, cuerpo) {
     return new Promise((resolve) => {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent?key=${GEMINI_API_KEY}`;
-        const payload = JSON.stringify({ contents, generationConfig });
+        const payload = JSON.stringify(cuerpo);
 
         const req = https.request(url, {
             method: 'POST',
@@ -601,7 +1159,7 @@ function llamarModelo(modelo, contents, generationConfig) {
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(payload)
             },
-            timeout: 20000
+            timeout: 25000
         }, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
@@ -609,12 +1167,15 @@ function llamarModelo(modelo, contents, generationConfig) {
                 if (res.statusCode === 200) {
                     try {
                         const parsed = JSON.parse(data);
-                        const texto = parsed.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-                        if (texto) return resolve({ texto });
+                        const contenido = parsed.candidates?.[0]?.content;
+                        const partes = contenido?.parts || [];
+                        const texto = partes.filter(p => typeof p.text === 'string' && !p.thought).map(p => p.text).join('').trim();
+                        const llamadas = partes.filter(p => p.functionCall).map(p => p.functionCall);
+                        if (texto || llamadas.length) return resolve({ contenido, texto, llamadas });
                     } catch (e) {
                         console.error('Error parseando respuesta de Gemini:', e.message);
                     }
-                    return resolve({ status: 200, reintentar: false });
+                    return resolve({ status: 200, mensaje: 'respuesta vacía', reintentar: true });
                 }
                 let mensaje = '';
                 try { mensaje = JSON.parse(data)?.error?.message || ''; } catch (e) { mensaje = data.slice(0, 200); }
@@ -633,21 +1194,59 @@ function llamarModelo(modelo, contents, generationConfig) {
     });
 }
 
-// Prueba el modelo principal hasta 3 veces (esperando 2 s y 5 s) y luego cada modelo de respaldo.
-async function llamarGemini(contents, generationConfig, { intentos = 3 } = {}) {
-    const modelos = [GEMINI_MODEL, ...GEMINI_MODELOS_RESPALDO];
+function llamarModelo(modelo, contents, generationConfig) {
+    return llamarModeloCuerpo(modelo, { contents, generationConfig });
+}
+
+// Prueba un cuerpo con el modelo indicado (o con el principal y los de respaldo) y reintenta si está saturado.
+async function llamarConReintentos(cuerpo, { modelos = [GEMINI_MODEL, ...GEMINI_MODELOS_RESPALDO], intentos = 3 } = {}) {
     const esperas = [2000, 5000];
     for (const modelo of modelos) {
         for (let i = 0; i < intentos; i++) {
-            const r = await llamarModelo(modelo, contents, generationConfig);
-            if (r.texto) {
+            const r = await llamarModeloCuerpo(modelo, cuerpo);
+            if (r.contenido) {
                 ultimoErrorGemini = null;
-                return r.texto;
+                return { ...r, modelo };
             }
             ultimoErrorGemini = { modelo, status: r.status, mensaje: r.mensaje, en: new Date() };
             if (!r.reintentar) break;
             if (i < intentos - 1) await esperar(esperas[i] || 5000);
         }
+    }
+    return null;
+}
+
+// Prueba el modelo principal hasta 3 veces (esperando 2 s y 5 s) y luego cada modelo de respaldo.
+async function llamarGemini(contents, generationConfig, { intentos = 3 } = {}) {
+    const r = await llamarConReintentos({ contents, generationConfig }, { intentos });
+    return r?.texto || null;
+}
+
+// Conversación con herramientas: el modelo puede pedir ejecutar funciones; se ejecutan y se le devuelve el resultado.
+// Una vez que un modelo respondió, el resto de la vuelta usa el mismo modelo (las firmas de razonamiento son por modelo).
+async function conversarConHerramientas({ instrucciones, contents, herramientas, ejecutar, maxPasos = 4, generationConfig }) {
+    const conversacion = [...contents];
+    let modeloFijo = null;
+    for (let paso = 0; paso < maxPasos; paso++) {
+        const cuerpo = {
+            systemInstruction: { parts: [{ text: instrucciones }] },
+            contents: conversacion,
+            tools: [{ functionDeclarations: herramientas }],
+            generationConfig: generationConfig || { maxOutputTokens: 800, temperature: 0.4 }
+        };
+        const r = await llamarConReintentos(cuerpo, modeloFijo ? { modelos: [modeloFijo] } : {});
+        if (!r) return null;
+        modeloFijo = r.modelo;
+        if (!r.llamadas.length) return r.texto || null;
+
+        conversacion.push(r.contenido);
+        const respuestas = [];
+        for (const llamada of r.llamadas) {
+            console.log(`[HERRAMIENTA] ${llamada.name} ${JSON.stringify(llamada.args || {})}`);
+            const resultado = await ejecutar(llamada.name, llamada.args || {});
+            respuestas.push({ functionResponse: { name: llamada.name, response: { resultado } } });
+        }
+        conversacion.push({ role: 'user', parts: respuestas });
     }
     return null;
 }
@@ -670,22 +1269,17 @@ async function consultarGemini(remitenteId, mensajeTexto) {
     const textoUsuario = previo ? previo.parts[0].text + '\n' + mensajeTexto : mensajeTexto;
     const mensajeUsuario = { role: 'user', parts: [{ text: textoUsuario }] };
 
-    const contents = [
-        { role: 'user', parts: [{ text: construirInstrucciones() }] },
-        { role: 'model', parts: [{ text: 'Entendido. Actuaré como el asistente virtual formal del Estudio Jaime Irigoyen siguiendo estrictamente estas reglas.' }] },
-        ...base,
-        mensajeUsuario
-    ];
-
-    const reply = await llamarGemini(contents, { maxOutputTokens: 250, temperature: 0.5 });
-    if (!reply) {
-        userHistories.set(remitenteId, [...base, mensajeUsuario].slice(-MAX_TURNOS_HISTORIAL));
-        return null;
-    }
-
-    const nuevoHistorial = [...base, mensajeUsuario, { role: 'model', parts: [{ text: reply }] }];
-    userHistories.set(remitenteId, nuevoHistorial.slice(-MAX_TURNOS_HISTORIAL));
-    return reply;
+    const instrucciones = construirInstrucciones() + '\n\nCONTEXTO ACTUAL:\n' + await contextoCliente(remitenteId);
+    const reply = await conversarConHerramientas({
+        instrucciones,
+        contents: [...base, mensajeUsuario],
+        herramientas: HERRAMIENTAS_CLIENTE,
+        ejecutar: (nombre, args) => ejecutarHerramientaCliente(remitenteId, nombre, args)
+    });
+    // El historial se vuelve a leer de la base en cada mensaje: así incluye también los avisos que manda el sistema
+    // (confirmaciones, recordatorios) en el orden correcto.
+    userHistories.delete(remitenteId);
+    return reply || null;
 }
 
 // ---------- Detección de nombre via IA (solo mientras no lo tengamos) ----------
@@ -801,6 +1395,310 @@ async function avisarFallaRespuesta(sock, sender, numero, text) {
     }
 }
 
+// ---------- Asistente del administrador (conversación natural) ----------
+// Desde el número del administrador se habla con el bot en lenguaje natural. Las acciones que afectan a un cliente
+// o no tienen vuelta atrás quedan en espera hasta que el administrador responda "sí".
+
+const HERRAMIENTAS_ADMIN = [
+    { name: 'estado_bot', description: 'Estado técnico del bot: WhatsApp, base de datos, Gemini y Google Calendar.', parameters: { type: 'OBJECT', properties: {} } },
+    {
+        name: 'ver_agenda', description: 'Reuniones del calendario y turnos pendientes de los próximos días.',
+        parameters: { type: 'OBJECT', properties: { dias: { type: 'INTEGER', description: 'Cantidad de días (por defecto 7).' } } }
+    },
+    {
+        name: 'ver_disponibilidad', description: 'Franjas de atención de cada día (horario normal y cambios cargados).',
+        parameters: { type: 'OBJECT', properties: { dias: { type: 'INTEGER', description: 'Cantidad de días (por defecto 7).' } } }
+    },
+    {
+        name: 'bloquear_horario', description: 'Bloquea un día entero o una franja para que no se ofrezcan turnos.',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                fecha: { type: 'STRING', description: 'AAAA-MM-DD' },
+                desde: { type: 'STRING', description: 'HH:MM, opcional. Sin desde/hasta se bloquea el día entero.' },
+                hasta: { type: 'STRING', description: 'HH:MM, opcional.' }
+            },
+            required: ['fecha']
+        }
+    },
+    {
+        name: 'abrir_horario', description: 'Habilita una franja extra de atención en un día (por ejemplo, fuera del horario normal).',
+        parameters: {
+            type: 'OBJECT',
+            properties: { fecha: { type: 'STRING', description: 'AAAA-MM-DD' }, desde: { type: 'STRING', description: 'HH:MM' }, hasta: { type: 'STRING', description: 'HH:MM' } },
+            required: ['fecha', 'desde', 'hasta']
+        }
+    },
+    {
+        name: 'restablecer_dia', description: 'Borra los cambios de un día y vuelve al horario normal. Para limitar un día a una franja, primero restablecé y después bloqueá lo que sobra.',
+        parameters: { type: 'OBJECT', properties: { fecha: { type: 'STRING', description: 'AAAA-MM-DD' } }, required: ['fecha'] }
+    },
+    {
+        name: 'confirmar_turno', description: 'Confirma un pedido de turno: crea la reunión con Meet y le avisa al cliente.',
+        parameters: { type: 'OBJECT', properties: { turno_id: { type: 'INTEGER' } }, required: ['turno_id'] }
+    },
+    {
+        name: 'rechazar_turno', description: 'Rechaza un pedido de turno y le ofrece al cliente otros horarios disponibles.',
+        parameters: { type: 'OBJECT', properties: { turno_id: { type: 'INTEGER' } }, required: ['turno_id'] }
+    },
+    {
+        name: 'proponer_horario', description: 'Le propone al cliente un horario distinto al que pidió. Si el cliente acepta, se confirma solo.',
+        parameters: {
+            type: 'OBJECT',
+            properties: { turno_id: { type: 'INTEGER' }, fecha: { type: 'STRING', description: 'AAAA-MM-DD' }, hora: { type: 'STRING', description: 'HH:MM' } },
+            required: ['turno_id', 'fecha', 'hora']
+        }
+    },
+    {
+        name: 'cancelar_turno', description: 'Cancela un turno o reunión ya confirmada, borra el evento del calendario y avisa al cliente.',
+        parameters: { type: 'OBJECT', properties: { turno_id: { type: 'INTEGER' } }, required: ['turno_id'] }
+    },
+    {
+        name: 'agregar_regla', description: 'Agrega una instrucción permanente para cómo el bot atiende a los clientes.',
+        parameters: { type: 'OBJECT', properties: { texto: { type: 'STRING' } }, required: ['texto'] }
+    },
+    { name: 'listar_reglas', description: 'Lista las reglas cargadas para el bot.', parameters: { type: 'OBJECT', properties: {} } },
+    {
+        name: 'borrar_regla', description: 'Borra una regla por su número (según listar_reglas).',
+        parameters: { type: 'OBJECT', properties: { numero: { type: 'INTEGER' } }, required: ['numero'] }
+    }
+];
+
+const HERRAMIENTAS_SENSIBLES = new Set(['confirmar_turno', 'rechazar_turno', 'proponer_horario', 'cancelar_turno', 'borrar_regla']);
+const VIGENCIA_ACCION_MIN = 30;
+let historialAdmin = [];
+let ultimoMensajeAdmin = 0;
+
+function normalizarTexto(t) {
+    return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function esAfirmativo(t) {
+    const n = normalizarTexto(t);
+    return n.length <= 30 && /^(si+|sip|sii|dale|ok|okey|okay|oka|confirmo|confirma|confirmalo|confirmar|de acuerdo|perfecto|listo|adelante|claro|obvio|va|hacelo|si dale|dale si|si confirmo|si confirmalo|si por favor|si gracias|dale gracias|ok dale|si si)( por favor| gracias)?$/.test(n);
+}
+
+function esNegativo(t) {
+    const n = normalizarTexto(t);
+    return n.length <= 20 && /^(no|nop|nope|negativo|mejor no|no gracias|no no|cancelalo|no lo confirmes)$/.test(n);
+}
+
+async function describirAccion(nombre, args) {
+    const turno = args.turno_id ? await obtenerTurno(args.turno_id) : null;
+    const t = turno ? descripcionTurno(turno) : `turno #${args.turno_id}`;
+    switch (nombre) {
+        case 'confirmar_turno': return `confirmar el turno ${t} y mandarle el link de Meet al cliente`;
+        case 'rechazar_turno': return `rechazar el turno ${t} y ofrecerle otros horarios al cliente`;
+        case 'proponer_horario': return `proponerle a ${turno?.nombre || 'el cliente'} el ${etiquetaTurno(desdeBA(args.fecha, normalizarHora(args.hora) || '00:00'))} en lugar de su pedido`;
+        case 'cancelar_turno': return `cancelar el turno ${t}, borrarlo del calendario y avisarle al cliente`;
+        case 'borrar_regla': return `borrar la regla ${args.numero}: "${globalAdminRules[args.numero - 1]?.regla || '(no existe)'}"`;
+        default: return nombre;
+    }
+}
+
+async function ejecutarAccionAdmin(nombre, args) {
+    switch (nombre) {
+        case 'estado_bot': return { texto: await estadoSistema() };
+        case 'ver_agenda': return { texto: await resumenAgenda(Math.min(Math.max(args.dias || 7, 1), 30)) };
+        case 'ver_disponibilidad': return { texto: await resumenDisponibilidad(Math.min(Math.max(args.dias || 7, 1), 30)) };
+        case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
+        case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
+        case 'restablecer_dia': return restablecerDia(args.fecha);
+        case 'confirmar_turno': return confirmarTurno(args.turno_id);
+        case 'rechazar_turno': return rechazarTurno(args.turno_id);
+        case 'proponer_horario': return proponerHorario(args.turno_id, args.fecha, args.hora);
+        case 'cancelar_turno': return cancelarTurno(args.turno_id);
+        case 'agregar_regla': {
+            if (!args.texto) return { ok: false, mensaje: 'Falta el texto de la regla.' };
+            await db.query('INSERT INTO reglas_admin (regla) VALUES ($1)', [args.texto]);
+            await cargarReglas();
+            return { ok: true, mensaje: `Regla guardada: "${args.texto}"` };
+        }
+        case 'listar_reglas':
+            return { texto: globalAdminRules.length ? globalAdminRules.map((r, i) => `${i + 1}. ${r.regla}`).join('\n') : 'No hay reglas cargadas.' };
+        case 'borrar_regla': {
+            const regla = globalAdminRules[args.numero - 1];
+            if (!regla) return { ok: false, mensaje: `No existe la regla ${args.numero}.` };
+            await db.query('DELETE FROM reglas_admin WHERE id = $1', [regla.id]);
+            await cargarReglas();
+            return { ok: true, mensaje: `Borré la regla: "${regla.regla}"` };
+        }
+    }
+    return { ok: false, mensaje: 'Acción desconocida.' };
+}
+
+async function leerAccionPendiente() {
+    const valor = await leerConfig('accion_pendiente');
+    if (!valor) return null;
+    try {
+        const a = JSON.parse(valor);
+        if (Date.now() - a.creada > VIGENCIA_ACCION_MIN * 60000) { await borrarConfig('accion_pendiente'); return null; }
+        return a;
+    } catch (e) {
+        return null;
+    }
+}
+
+function calendarioReferencia() {
+    const hoy = partesBA(Date.now()).fecha;
+    const lineas = [];
+    for (let i = 0; i < 14; i++) {
+        const f = sumarDiasFecha(hoy, i);
+        lineas.push(`${f} = ${etiquetaFecha(desdeBA(f, '12:00'))}${i === 0 ? ' (hoy)' : i === 1 ? ' (mañana)' : ''}`);
+    }
+    return lineas.join('\n');
+}
+
+async function instruccionesAdmin() {
+    const pendientes = await turnosPendientesAdmin().catch(() => []);
+    return 'Sos el asistente personal del administrador del Estudio Jurídico Jaime Irigoyen, por WhatsApp. ' +
+        'Hablás en español rioplatense, de "vos", con tono cercano, claro y breve (2 a 5 líneas salvo que muestres una lista).\n' +
+        'Para cualquier dato o acción usá las herramientas: nunca inventes reuniones, horarios ni estados.\n' +
+        'Horario normal de atención: lunes a viernes de 12 a 18 hs. Turnos de 30 min + 15 de margen.\n' +
+        'Si una herramienta responde "requiere_confirmacion", preguntale al administrador si confirma, repitiendo la descripción tal cual, y terminá con "¿Confirmo?". No la des por hecha.\n' +
+        'Si no queda claro qué día, qué turno o qué horario quiere, preguntá antes de actuar.\n\n' +
+        `Hoy es ${etiquetaTurno(new Date())}. Referencia de fechas:\n${calendarioReferencia()}\n\n` +
+        (pendientes.length ? `Pedidos de turno esperando tu confirmación:\n${pendientes.map(descripcionTurno).join('\n')}` : 'No hay pedidos de turno esperando confirmación.');
+}
+
+async function procesarMensajeAdmin(sock, sender, text) {
+    const responder = (t) => sock.sendMessage(sender, { text: t });
+
+    // 1) Respuesta a una acción que quedó esperando confirmación.
+    const pendiente = await leerAccionPendiente();
+    if (pendiente) {
+        if (esAfirmativo(text)) {
+            await borrarConfig('accion_pendiente');
+            const r = await ejecutarAccionAdmin(pendiente.nombre, pendiente.args);
+            return responder(r.mensaje || r.texto || 'Listo.');
+        }
+        if (esNegativo(text)) {
+            await borrarConfig('accion_pendiente');
+            return responder('Perfecto, no hago nada. 👍');
+        }
+        await borrarConfig('accion_pendiente'); // cambió de tema: se descarta la acción en espera
+    }
+
+    // 2) "Sí" o "no" directo a un único pedido de turno pendiente.
+    if (esAfirmativo(text) || esNegativo(text)) {
+        const pendientes = await turnosPendientesAdmin();
+        if (pendientes.length === 1) {
+            const r = esAfirmativo(text) ? await confirmarTurno(pendientes[0].id) : await rechazarTurno(pendientes[0].id);
+            return responder(r.mensaje);
+        }
+    }
+
+    // 3) Conversación con el asistente.
+    if (Date.now() - ultimoMensajeAdmin > 2 * 60 * 60 * 1000) historialAdmin = [];
+    ultimoMensajeAdmin = Date.now();
+    const mensajeUsuario = { role: 'user', parts: [{ text }] };
+    const respuesta = await conversarConHerramientas({
+        instrucciones: await instruccionesAdmin(),
+        contents: [...historialAdmin, mensajeUsuario],
+        herramientas: HERRAMIENTAS_ADMIN,
+        generationConfig: { maxOutputTokens: 1000, temperature: 0.3 },
+        ejecutar: async (nombre, args) => {
+            try {
+                if (HERRAMIENTAS_SENSIBLES.has(nombre)) {
+                    const descripcion = await describirAccion(nombre, args);
+                    await guardarConfig('accion_pendiente', JSON.stringify({ nombre, args, descripcion, creada: Date.now() }));
+                    return { requiere_confirmacion: true, descripcion: `Entendí: ${descripcion}.` };
+                }
+                return await ejecutarAccionAdmin(nombre, args);
+            } catch (e) {
+                console.error(`Error en herramienta de admin ${nombre}:`, e.message);
+                return { ok: false, mensaje: `Error: ${e.message}` };
+            }
+        }
+    });
+
+    const texto = respuesta || 'Perdón, no pude procesar eso ahora (Gemini no respondió). Probá de nuevo en un minuto o usá un comando, por ejemplo "ADMIN AGENDA".';
+    if (respuesta) historialAdmin = [...historialAdmin, mensajeUsuario, { role: 'model', parts: [{ text: respuesta }] }].slice(-12);
+    return responder(texto);
+}
+
+// ---------- Tareas programadas: avisos, vencimientos y recordatorios ----------
+
+const RECORDATORIOS_CLIENTE = [
+    { clave: 'c24', min: 24 * 60 },
+    { clave: 'c12', min: 12 * 60 },
+    { clave: 'c60', min: 60 },
+    { clave: 'c10', min: 10 }
+];
+const RECORDATORIOS_ADMIN = [
+    { clave: 'a20', min: 20 },
+    { clave: 'a10', min: 10 },
+    { clave: 'a5', min: 5 }
+];
+
+function textoRecordatorioCliente(clave, t) {
+    const cuando = etiquetaTurno(t.inicio);
+    switch (clave) {
+        case 'c24': return `Buenas tardes${t.nombre ? `, ${t.nombre}` : ''}. Le recordamos su reunión con un asesor del Estudio el ${cuando} por Google Meet. ¿Nos confirma su asistencia?`;
+        case 'c12': return `Le recordamos su reunión con el Estudio el ${cuando} por Google Meet.`;
+        case 'c60': return `Su reunión con el Estudio comienza en 1 hora (${partesBA(t.inicio).hora} hs).\n\nLink: ${t.meet}`;
+        case 'c10': return `En 10 minutos comienza su reunión con el Estudio.\n\nLink: ${t.meet}`;
+    }
+    return '';
+}
+
+function textoRecordatorioAdmin(clave, t) {
+    const min = { a20: 20, a10: 10, a5: 5 }[clave];
+    return `⏰ En ${min} minutos: reunión con ${t.nombre || 'cliente'} (${t.producto || 'consulta'}${t.tipo === 'dudas' ? ', dudas de presupuesto' : ''})` +
+        `${t.asistencia_confirmada ? ' · confirmó asistencia ✅' : ''}\n🎥 ${t.meet}`;
+}
+
+let revisandoTareas = false;
+
+async function revisarTareas() {
+    if (revisandoTareas || !dbOk || !isConnected) return;
+    revisandoTareas = true;
+    try {
+        const ahora = Date.now();
+
+        // Pedidos sin respuesta del administrador.
+        const { rows: pendientes } = await db.query(`SELECT * FROM turnos WHERE estado = 'pendiente_admin'`);
+        for (const t of pendientes) {
+            const inicio = new Date(t.inicio).getTime();
+            if (inicio - ahora < 60 * 60000) {
+                await actualizarTurno(t.id, { estado: 'vencido' });
+                await enviarACliente(t.telefono, `Disculpe, no pudimos confirmar a tiempo la reunión del ${etiquetaTurno(t.inicio)}. Si lo desea, le ofrezco nuevos horarios.`).catch(() => {});
+                await enviarAAdmin(`⌛ El pedido #${t.id} de ${t.nombre || 'un cliente'} (${etiquetaTurno(t.inicio)}) venció sin confirmación. Le avisé al cliente.`);
+                continue;
+            }
+            if (!t.segundo_aviso && t.avisado_admin_en && ahora - new Date(t.avisado_admin_en).getTime() > 60 * 60000) {
+                await actualizarTurno(t.id, { segundo_aviso: true });
+                await enviarAAdmin(textoAvisoTurno(t, true));
+            }
+        }
+
+        // Recordatorios de reuniones confirmadas.
+        const { rows: confirmados } = await db.query(
+            `SELECT * FROM turnos WHERE estado = 'confirmado' AND inicio > NOW() AND inicio < NOW() + INTERVAL '25 hours'`);
+        for (const t of confirmados) {
+            const inicio = new Date(t.inicio).getTime();
+            const hechos = t.recordatorios || {};
+            const nuevos = { ...hechos };
+            for (const r of [...RECORDATORIOS_CLIENTE, ...RECORDATORIOS_ADMIN]) {
+                if (hechos[r.clave]) continue;
+                const momento = inicio - r.min * 60000;
+                if (ahora < momento) continue;
+                const ventana = Math.min(30, r.min / 2) * 60000;
+                nuevos[r.clave] = ahora < momento + ventana ? 'enviado' : 'omitido';
+                if (nuevos[r.clave] === 'omitido') continue;
+                if (r.clave === 'c24' && t.asistencia_confirmada) continue;
+                if (r.clave.startsWith('c')) await enviarACliente(t.telefono, textoRecordatorioCliente(r.clave, t)).catch(e => console.error('Recordatorio:', e.message));
+                else await enviarAAdmin(textoRecordatorioAdmin(r.clave, t));
+            }
+            if (JSON.stringify(nuevos) !== JSON.stringify(hechos)) await actualizarTurno(t.id, { recordatorios: JSON.stringify(nuevos) });
+        }
+    } catch (e) {
+        console.error('Error en tareas programadas:', e.message);
+    } finally {
+        revisandoTareas = false;
+    }
+}
+
 // ---------- Comandos del administrador ----------
 
 const REGEX_COMANDO_ADMIN = /^ADMIN(:|\s+LISTAR$|\s+BORRAR(\s+\d+)?$|\s+ESTADO$|\s+MODELOS$|\s+CONECTAR\s+GOOGLE$|\s+AGENDA$|\s+PRUEBA\s+REUNION$|\s+AYUDA$)/i;
@@ -882,7 +1780,8 @@ async function procesarComandoAdmin(sock, sender, text) {
 
     if (/^ADMIN\s+AYUDA$/i.test(comando)) {
         await sock.sendMessage(sender, { text:
-            '🛠️ *Comandos de administrador*\n\n' +
+            '💬 Podés hablarme normal, por ejemplo: "¿qué tengo esta semana?", "el jueves no puedo", "el viernes atiendo de 14 a 16", "confirmale a Juan".\n\n' +
+            '🛠️ *Comandos exactos (respaldo)*\n\n' +
             '• ADMIN ESTADO: estado de WhatsApp, base, Gemini y agenda\n' +
             '• ADMIN MODELOS: modelos de Gemini disponibles\n' +
             '• ADMIN CONECTAR GOOGLE: link para conectar Google Calendar\n' +
@@ -1054,9 +1953,11 @@ async function connectToWhatsApp() {
                 const numero = numeroCliente(msg);
                 console.log(`[MSG] ${sender}${numero ? ` (+${numero})` : ''}: ${text}`);
 
-                // Comandos del administrador
-                if (REGEX_COMANDO_ADMIN.test(text.trim()) && esAdmin(msg)) {
-                    await procesarComandoAdmin(sock, sender, text);
+                // El administrador: comandos exactos o conversación natural. Nunca se lo atiende como cliente.
+                if (esAdmin(msg)) {
+                    await sock.sendPresenceUpdate('composing', sender).catch(() => {});
+                    if (REGEX_COMANDO_ADMIN.test(text.trim())) await procesarComandoAdmin(sock, sender, text);
+                    else await procesarMensajeAdmin(sock, sender, text);
                     continue;
                 }
 
@@ -1103,6 +2004,13 @@ app.listen(PORT, async () => {
     await inicializarDB();
     if (dbOk) await cargarReglas();
     setTimeout(connectToWhatsApp, 5000);
+    setInterval(revisarTareas, 60 * 1000);
 });
 
-module.exports = { limpiarNombre, filasAHistorial, numeroCliente, soloDigitos, fechaBA, emailDesdeIdToken, horaCorta };
+module.exports = {
+    limpiarNombre, filasAHistorial, numeroCliente, soloDigitos, fechaBA, emailDesdeIdToken, horaCorta,
+    partesBA, desdeBA, franjasDelDia, elegirOpciones, horariosLibres, esAfirmativo, esNegativo, etiquetaTurno,
+    ejecutarHerramientaCliente, procesarMensajeAdmin, revisarTareas, conversarConHerramientas, confirmarTurno,
+    inicializarDB, guardarConfig, consultarGemini, db,
+    _set: (k, v) => { if (k === 'socket') socketActual = v; if (k === 'conectado') isConnected = v; if (k === 'dbOk') dbOk = v; }
+};
