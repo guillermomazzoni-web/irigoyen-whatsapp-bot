@@ -732,14 +732,28 @@ async function ocupadoGoogle(desde, hasta) {
 }
 
 // Saca de la lista de ocupados de Google el evento del propio turno (si lo tiene), para poder moverlo.
+// Google devuelve los ocupados recortados a la ventana consultada y unidos entre sí, así que la reunión propia se
+// descuenta por superposición (no por coincidencia exacta).
 async function sinEventoPropio(google, excluirId) {
     for (const id of [].concat(excluirId || []).filter(Boolean)) {
         const t = await obtenerTurno(id).catch(() => null);
-        if (!t || !t.evento_id) continue;
-        const a = new Date(t.inicio).getTime(), b = new Date(t.fin).getTime();
-        google = google.filter(([x, y]) => !(x === a && y === b));
+        if (!t || !t.evento_id || t.estado !== 'confirmado') continue;
+        google = restarIntervalo(google, [new Date(t.inicio).getTime(), new Date(t.fin).getTime()]).filter(([x, y]) => y > x);
     }
     return google;
+}
+
+// Describe con qué choca un horario ocupado (otra reunión del bot o un evento del calendario).
+async function describirChoque(google, desde, hasta, excluirIds = []) {
+    const excluir = [].concat(excluirIds || []);
+    try {
+        const { rows } = await db.query(
+            `SELECT * FROM turnos WHERE estado = ANY($1) AND inicio < $3 AND fin > $2 ORDER BY inicio`, [ESTADOS_OCUPAN, desde, hasta]);
+        const otro = rows.find(r => !excluir.includes(r.id));
+        if (otro) return `choca con ${otro.estado === 'confirmado' ? 'la reunión' : 'el pedido'} de ${otro.nombre || 'otro cliente'} (${etiquetaTurno(otro.inicio)}, #${otro.id})`;
+    } catch (e) { /* sin detalle */ }
+    if (google?.length) return `choca con un evento de tu calendario de ${partesBA(google[0][0]).hora} a ${partesBA(google[0][1]).hora}`;
+    return 'ya está ocupado';
 }
 
 async function ocupadoTurnos(desde, hasta, excluirId = null) {
@@ -899,7 +913,10 @@ async function confirmarTurno(id) {
     let google = await ocupadoGoogle(new Date(t.inicio), new Date(t.fin));
     if (google === null) return { ok: false, mensaje: 'No pude leer la agenda de Google. Revisá que esté conectada.' };
     if (anterior) google = await sinEventoPropio(google, anterior.id);
-    if (google.length) return { ok: false, mensaje: `El horario del turno #${id} ya está ocupado en el calendario. Pedime ofrecerle otro.` };
+    if (google.length) {
+        const choque = await describirChoque(google, new Date(t.inicio), new Date(t.fin), [t.id, anterior?.id]);
+        return { ok: false, mensaje: `No pude confirmar el turno #${id} (${etiquetaTurno(t.inicio)}): ${choque}. Pedime proponerle otro horario.` };
+    }
 
     const evento = await crearEventoConMeet({
         titulo: `${t.tipo === 'dudas' ? 'Dudas de presupuesto' : 'Consulta'} ${t.producto || ''} – ${t.nombre || 'Cliente'}`.replace(/\s+/g, ' '),
@@ -965,7 +982,10 @@ async function proponerHorario(id, fecha, hora) {
     if (google === null) return { ok: false, mensaje: 'No pude leer la agenda de Google.' };
     google = await sinEventoPropio(google, vigente?.id);
     const otros = (await ocupadoTurnos(inicio, fin, t.id)).filter(([x, y]) => !(vigente && x === new Date(vigente.inicio).getTime() && y === new Date(vigente.fin).getTime()));
-    if (google.length || otros.length) return { ok: false, mensaje: `El ${etiquetaTurno(inicio)} ya está ocupado.` };
+    if (google.length || otros.length) {
+        const choque = await describirChoque(google, inicio, fin, [t.id, vigente?.id]);
+        return { ok: false, mensaje: `El ${etiquetaTurno(inicio)} no está libre: ${choque}.` };
+    }
 
     if (['pendiente_admin', 'propuesto'].includes(t.estado)) await actualizarTurno(t.id, { estado: 'rechazado' });
     const { rows } = await db.query(
@@ -1334,7 +1354,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             }
             const r = await confirmarTurno(t.id);
             if (r.ok) await enviarAAdmin(`✅ ${t.nombre || 'El cliente'} aceptó el ${etiquetaTurno(t.inicio)}. Quedó confirmado.`);
-            return r.ok ? { ok: true, confirmado: true, aviso: 'El sistema ya le envió la confirmación. El link de Meet le llega 15 minutos antes; no lo compartas.' } : { error: r.mensaje };
+            return r.ok ? { ok: true, confirmado: true, _silencio: true, aviso: 'El sistema ya le envió la confirmación.' } : { error: r.mensaje };
         }
     } catch (e) {
         console.error(`Error en herramienta ${nombre}:`, e.message);
@@ -2086,8 +2106,20 @@ async function instruccionesAdmin() {
         (pendientes.length ? `Pedidos de turno esperando tu confirmación:\n${pendientes.map(descripcionTurno).join('\n')}` : 'No hay pedidos de turno esperando confirmación.');
 }
 
+// Lo que se resuelve sin pasar por Gemini (un "sí" directo) también queda en la conversación del asistente,
+// así después sabe qué se hizo.
+function recordarEnHistorialAdmin(textoAdmin, respuesta) {
+    if (Date.now() - ultimoMensajeAdmin > 2 * 60 * 60 * 1000) historialAdmin = [];
+    ultimoMensajeAdmin = Date.now();
+    historialAdmin = [...historialAdmin, { role: 'user', parts: [{ text: textoAdmin }] }, { role: 'model', parts: [{ text: respuesta }] }].slice(-12);
+}
+
 async function procesarMensajeAdmin(sock, sender, text) {
-    const responder = (t) => sock.sendMessage(sender, { text: t });
+
+    const responder = async (t) => {
+        await sock.sendMessage(sender, { text: t });
+        recordarEnHistorialAdmin(text, t);
+    };
 
     // 1) Respuesta a una acción que quedó esperando confirmación.
     const pendiente = await leerAccionPendiente();
@@ -2117,6 +2149,10 @@ async function procesarMensajeAdmin(sock, sender, text) {
     if (Date.now() - ultimoMensajeAdmin > 2 * 60 * 60 * 1000) historialAdmin = [];
     ultimoMensajeAdmin = Date.now();
     const mensajeUsuario = { role: 'user', parts: [{ text }] };
+    // Si el admin responde "sí" a una pregunta del asistente (por ejemplo "¿se lo propongo a las 16:30?"),
+    // la acción se ejecuta directamente, sin volver a pedir confirmación.
+    const ultimaDelAsistente = historialAdmin.length ? historialAdmin[historialAdmin.length - 1] : null;
+    const yaConfirmo = esAfirmativo(text) && ultimaDelAsistente?.role === 'model' && /\?\s*$/.test(ultimaDelAsistente.parts?.[0]?.text || '');
     const respuesta = await conversarConHerramientas({
         instrucciones: await instruccionesAdmin(),
         contents: [...historialAdmin, mensajeUsuario],
@@ -2124,7 +2160,7 @@ async function procesarMensajeAdmin(sock, sender, text) {
         generationConfig: { maxOutputTokens: 1000, temperature: 0.3 },
         ejecutar: async (nombre, args) => {
             try {
-                if (HERRAMIENTAS_SENSIBLES.has(nombre)) {
+                if (HERRAMIENTAS_SENSIBLES.has(nombre) && !yaConfirmo) {
                     const descripcion = await describirAccion(nombre, args);
                     await guardarConfig('accion_pendiente', JSON.stringify({ nombre, args, descripcion, creada: Date.now() }));
                     return { requiere_confirmacion: true, descripcion: `Entendí: ${descripcion}.` };
@@ -2138,8 +2174,8 @@ async function procesarMensajeAdmin(sock, sender, text) {
     });
 
     const texto = respuesta || 'Perdón, no pude procesar eso ahora (Gemini no respondió). Probá de nuevo en un minuto o usá un comando, por ejemplo "ADMIN AGENDA".';
-    if (respuesta) historialAdmin = [...historialAdmin, mensajeUsuario, { role: 'model', parts: [{ text: respuesta }] }].slice(-12);
-    return responder(texto);
+    await sock.sendMessage(sender, { text: texto });
+    if (respuesta) recordarEnHistorialAdmin(text, respuesta);
 }
 
 // ---------- Tareas programadas: avisos, vencimientos y recordatorios ----------
@@ -2573,5 +2609,6 @@ module.exports = {
     ejecutarHerramientaCliente, procesarMensajeAdmin, revisarTareas, conversarConHerramientas, confirmarTurno,
     inicializarDB, guardarConfig, consultarGemini, db, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, avisarTurnosEnFeriados, rechazarTurno, proponerHorario, interpretarFecha, construirInstrucciones, textoRecordatorioCliente, esAfirmativoCliente, esNegativoCliente,
+    _historialAdmin: () => historialAdmin,
     _set: (k, v) => { if (k === 'socket') socketActual = v; if (k === 'conectado') isConnected = v; if (k === 'dbOk') dbOk = v; }
 };
