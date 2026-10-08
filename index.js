@@ -1413,7 +1413,25 @@ async function extraerDatosContacto(sender) {
     };
 }
 
+// Mensajes enviados recientemente (para reenviarlos si el destinatario no los pudo descifrar).
+const mensajesEnviados = new Map();
+const MAX_ENVIADOS = 500;
+function recordarEnviado(id, mensaje) {
+    mensajesEnviados.set(id, { mensaje, en: Date.now() });
+    if (mensajesEnviados.size > MAX_ENVIADOS) mensajesEnviados.delete(mensajesEnviados.keys().next().value);
+}
+
+// Chat por el que escribe el administrador: los avisos se mandan ahí, que es el que su teléfono descifra bien.
+let jidAdminConocido = null;
+async function recordarJidAdmin(jid) {
+    if (!jid || jid === jidAdminConocido) return;
+    jidAdminConocido = jid;
+    await guardarConfig('admin_jid', jid).catch(() => {});
+}
+
 async function obtenerJidAdmin(sock) {
+    if (!jidAdminConocido) jidAdminConocido = await leerConfig('admin_jid');
+    if (jidAdminConocido) return jidAdminConocido;
     try {
         const [resultado] = await sock.onWhatsApp(ADMIN_NUMBER);
         if (resultado?.exists && resultado.jid) return resultado.jid;
@@ -1986,8 +2004,17 @@ async function connectToWhatsApp() {
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false
+        printQRInTerminal: false,
+        // Si el teléfono de destino no puede descifrar un mensaje ("Esperando el mensaje"), WhatsApp pide reenviarlo:
+        // getMessage le entrega a la librería el contenido guardado para que lo vuelva a mandar.
+        getMessage: async (key) => mensajesEnviados.get(key.id)?.mensaje
     });
+    const enviarOriginal = sock.sendMessage.bind(sock);
+    sock.sendMessage = async (jid, contenido, opciones) => {
+        const enviado = await enviarOriginal(jid, contenido, opciones);
+        if (enviado?.key?.id && enviado.message) recordarEnviado(enviado.key.id, enviado.message);
+        return enviado;
+    };
     socketActual = sock;
 
     sock.ev.on('connection.update', (update) => {
@@ -2034,6 +2061,7 @@ async function connectToWhatsApp() {
 
                 // El administrador: comandos exactos o conversación natural. Nunca se lo atiende como cliente.
                 if (esAdmin(msg)) {
+                    recordarJidAdmin(sender);
                     await sock.sendPresenceUpdate('composing', sender).catch(() => {});
                     if (REGEX_COMANDO_ADMIN.test(text.trim())) await procesarComandoAdmin(sock, sender, text);
                     else await procesarMensajeAdmin(sock, sender, text);
