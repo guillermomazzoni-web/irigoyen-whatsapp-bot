@@ -11,6 +11,10 @@
  *   AUTH_DIR                (opcional)    Carpeta de la sesión de WhatsApp. Con un volumen de Railway en /data, usar /data/auth.
  *   PANEL_PASSWORD          (opcional)    Si se configura, la página del QR pide ?clave=... en la URL.
  *   PORT                    (opcional)    Puerto del servidor web (por defecto 3000).
+ *   GOOGLE_CLIENT_ID        (opcional)    Credencial OAuth de Google Cloud, para usar Google Calendar.
+ *   GOOGLE_CLIENT_SECRET    (opcional)    Secreto OAuth de Google Cloud.
+ *   GOOGLE_CUENTA           (opcional)    Única cuenta de Google que se acepta conectar (por defecto estudiojaimeirigoyen@gmail.com).
+ *   PUBLIC_URL              (opcional)    URL pública del bot (por defecto https://irigoyen-whatsapp-bot-production.up.railway.app).
  */
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
@@ -36,6 +40,13 @@ const RULES_FILE_LEGACY = 'reglas_admin.json'; // solo para migrar reglas viejas
 const MAX_TURNOS_HISTORIAL = 10;
 
 const MENSAJE_ERROR = 'Disculpe la demora. En unos minutos un asesor del Estudio le responderá personalmente.';
+
+const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || '').trim();
+const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
+const GOOGLE_CUENTA = (process.env.GOOGLE_CUENTA || 'estudiojaimeirigoyen@gmail.com').trim().toLowerCase();
+const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://irigoyen-whatsapp-bot-production.up.railway.app').replace(/\/$/, '');
+const GOOGLE_REDIRECT = `${PUBLIC_URL}/google/callback`;
+const ZONA_HORARIA = 'America/Argentina/Buenos_Aires';
 
 let currentQR = null;
 let isConnected = false;
@@ -130,6 +141,13 @@ async function inicializarDB() {
                 creada_en TIMESTAMPTZ DEFAULT NOW()
             );
         `);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS configuracion (
+                clave TEXT PRIMARY KEY,
+                valor TEXT NOT NULL,
+                actualizado_en TIMESTAMPTZ DEFAULT NOW()
+            );
+        `);
         dbOk = true;
         console.log('✅ Base de datos inicializada correctamente.');
     } catch (e) {
@@ -193,6 +211,266 @@ async function cargarHistorial(telefono) {
         return [];
     }
 }
+
+async function leerConfig(clave) {
+    try {
+        const { rows } = await db.query('SELECT valor FROM configuracion WHERE clave = $1', [clave]);
+        return rows[0]?.valor ?? null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function guardarConfig(clave, valor) {
+    await db.query(`
+        INSERT INTO configuracion (clave, valor, actualizado_en) VALUES ($1, $2, NOW())
+        ON CONFLICT (clave) DO UPDATE SET valor = EXCLUDED.valor, actualizado_en = NOW()
+    `, [clave, valor]);
+}
+
+async function borrarConfig(clave) {
+    await db.query('DELETE FROM configuracion WHERE clave = $1', [clave]);
+}
+
+// ---------- Google Calendar ----------
+// El permiso se da una sola vez: el administrador pide un link con "ADMIN CONECTAR GOOGLE",
+// inicia sesión con la cuenta del estudio, y el bot guarda el permiso (refresh token) en la base.
+
+const GOOGLE_SCOPES = [
+    'openid',
+    'email',
+    'https://www.googleapis.com/auth/calendar'
+].join(' ');
+
+const enlacesGoogle = new Map(); // estado de un solo uso -> vence (ms)
+let tokenGoogle = null;           // { access_token, vence }
+
+function solicitudHttps(metodo, url, { headers = {}, cuerpo = null, timeout = 20000 } = {}) {
+    return new Promise((resolve) => {
+        const datos = cuerpo == null ? null : (typeof cuerpo === 'string' ? cuerpo : JSON.stringify(cuerpo));
+        const req = https.request(url, {
+            method: metodo,
+            headers: {
+                ...(datos != null ? { 'Content-Length': Buffer.byteLength(datos) } : {}),
+                ...headers
+            },
+            timeout
+        }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                let json = null;
+                try { json = data ? JSON.parse(data) : null; } catch (e) { /* no es JSON */ }
+                resolve({ status: res.statusCode, json, texto: data });
+            });
+        });
+        req.on('timeout', () => req.destroy(new Error('Timeout')));
+        req.on('error', (err) => resolve({ status: 0, json: null, texto: err.message }));
+        if (datos != null) req.write(datos);
+        req.end();
+    });
+}
+
+function googleConfigurado() {
+    return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+}
+
+function crearEnlaceConexionGoogle() {
+    const estado = require('crypto').randomBytes(24).toString('hex');
+    enlacesGoogle.set(estado, Date.now() + 15 * 60 * 1000);
+    return `${PUBLIC_URL}/google/conectar?estado=${estado}`;
+}
+
+function estadoGoogleValido(estado) {
+    const vence = enlacesGoogle.get(estado);
+    if (!vence) return false;
+    if (Date.now() > vence) { enlacesGoogle.delete(estado); return false; }
+    return true;
+}
+
+function formulario(params) {
+    return Object.entries(params).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+}
+
+function emailDesdeIdToken(idToken) {
+    try {
+        const payload = idToken.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+        return (JSON.parse(Buffer.from(payload, 'base64').toString('utf8')).email || '').toLowerCase();
+    } catch (e) {
+        return '';
+    }
+}
+
+async function obtenerTokenGoogle() {
+    if (tokenGoogle && Date.now() < tokenGoogle.vence - 60000) return tokenGoogle.access_token;
+    const refresh = await leerConfig('google_refresh_token');
+    if (!refresh || !googleConfigurado()) return null;
+
+    const r = await solicitudHttps('POST', 'https://oauth2.googleapis.com/token', {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        cuerpo: formulario({
+            client_id: GOOGLE_CLIENT_ID,
+            client_secret: GOOGLE_CLIENT_SECRET,
+            refresh_token: refresh,
+            grant_type: 'refresh_token'
+        })
+    });
+    if (r.status === 200 && r.json?.access_token) {
+        tokenGoogle = { access_token: r.json.access_token, vence: Date.now() + (r.json.expires_in || 3600) * 1000 };
+        return tokenGoogle.access_token;
+    }
+    console.error('No se pudo renovar el permiso de Google:', r.status, r.json?.error || r.texto.slice(0, 200));
+    if (r.json?.error === 'invalid_grant') {
+        // El permiso fue revocado o venció: hay que volver a conectar.
+        await borrarConfig('google_refresh_token').catch(() => {});
+        tokenGoogle = null;
+    }
+    return null;
+}
+
+async function apiCalendar(metodo, ruta, cuerpo = null) {
+    const token = await obtenerTokenGoogle();
+    if (!token) return { status: 401, json: null, texto: 'Google Calendar no está conectado.' };
+    return solicitudHttps(metodo, `https://www.googleapis.com/calendar/v3${ruta}`, {
+        headers: { Authorization: `Bearer ${token}`, ...(cuerpo ? { 'Content-Type': 'application/json' } : {}) },
+        cuerpo
+    });
+}
+
+// Próximos eventos del calendario principal (por defecto, 7 días).
+async function eventosProximos(dias = 7) {
+    const desde = new Date();
+    const hasta = new Date(desde.getTime() + dias * 24 * 60 * 60 * 1000);
+    const q = formulario({
+        timeMin: desde.toISOString(),
+        timeMax: hasta.toISOString(),
+        singleEvents: 'true',
+        orderBy: 'startTime',
+        maxResults: '50',
+        timeZone: ZONA_HORARIA
+    });
+    const r = await apiCalendar('GET', `/calendars/primary/events?${q}`);
+    if (r.status !== 200) return null;
+    return (r.json.items || []).filter(e => e.status !== 'cancelled');
+}
+
+// Crea un evento con link de Meet. inicio y fin son fechas ISO con zona horaria.
+async function crearEventoConMeet({ titulo, descripcion = '', inicio, fin, invitados = [] }) {
+    const cuerpo = {
+        summary: titulo,
+        description: descripcion,
+        start: { dateTime: inicio, timeZone: ZONA_HORARIA },
+        end: { dateTime: fin, timeZone: ZONA_HORARIA },
+        attendees: invitados.map(email => ({ email })),
+        reminders: { useDefault: false, overrides: [] }, // los recordatorios los manda el bot por WhatsApp
+        conferenceData: {
+            createRequest: {
+                requestId: require('crypto').randomBytes(12).toString('hex'),
+                conferenceSolutionKey: { type: 'hangoutsMeet' }
+            }
+        }
+    };
+    const r = await apiCalendar('POST', '/calendars/primary/events?conferenceDataVersion=1&sendUpdates=none', cuerpo);
+    if (r.status !== 200) {
+        console.error('Error creando evento:', r.status, r.json?.error?.message || r.texto.slice(0, 200));
+        return null;
+    }
+    const meet = r.json.hangoutLink ||
+        r.json.conferenceData?.entryPoints?.find(p => p.entryPointType === 'video')?.uri || null;
+    return { id: r.json.id, link: r.json.htmlLink, meet };
+}
+
+// Fecha/hora en Buenos Aires (UTC-3, sin horario de verano) como texto ISO con zona.
+function fechaBA(dias, hora, minuto = 0) {
+    const ahoraBA = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const d = new Date(Date.UTC(ahoraBA.getUTCFullYear(), ahoraBA.getUTCMonth(), ahoraBA.getUTCDate() + dias, hora, minuto));
+    return d.toISOString().replace('Z', '').slice(0, 19) + '-03:00';
+}
+
+function horaCorta(fechaIso) {
+    return new Date(fechaIso).toLocaleString('es-AR', {
+        timeZone: ZONA_HORARIA, weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'
+    });
+}
+
+// Rutas web para conectar la cuenta (solo con link de un solo uso pedido por el administrador).
+app.get('/google/conectar', (req, res) => {
+    if (!googleConfigurado()) return res.status(500).send('Faltan GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET en Railway.');
+    const estado = String(req.query.estado || '');
+    if (!estadoGoogleValido(estado)) {
+        return res.status(403).send('Este link venció o ya se usó. Pedí uno nuevo por WhatsApp con "ADMIN CONECTAR GOOGLE".');
+    }
+    const url = 'https://accounts.google.com/o/oauth2/v2/auth?' + formulario({
+        client_id: GOOGLE_CLIENT_ID,
+        redirect_uri: GOOGLE_REDIRECT,
+        response_type: 'code',
+        scope: GOOGLE_SCOPES,
+        access_type: 'offline',
+        prompt: 'consent',
+        login_hint: GOOGLE_CUENTA,
+        state: estado
+    });
+    res.redirect(url);
+});
+
+function paginaSimple(titulo, mensaje, ok) {
+    return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>${titulo}</title>
+        <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0f172a;color:#f8fafc;margin:0;padding:16px;box-sizing:border-box}
+        .card{background:#1e293b;padding:32px;border-radius:16px;max-width:440px;width:100%;text-align:center}
+        h1{font-size:1.3rem;margin:0 0 12px;color:${ok ? '#34d399' : '#f87171'}}p{color:#cbd5e1;line-height:1.5;margin:0}</style></head>
+        <body><div class="card"><h1>${titulo}</h1><p>${mensaje}</p></div></body></html>`;
+}
+
+app.get('/google/callback', async (req, res) => {
+    const estado = String(req.query.estado || req.query.state || '');
+    if (!estadoGoogleValido(estado)) {
+        return res.status(403).send(paginaSimple('Link vencido', 'Pedí uno nuevo por WhatsApp con "ADMIN CONECTAR GOOGLE".', false));
+    }
+    enlacesGoogle.delete(estado);
+
+    if (req.query.error) {
+        return res.send(paginaSimple('No se conectó', `Google respondió: ${String(req.query.error)}. Podés intentar de nuevo pidiendo otro link.`, false));
+    }
+
+    const r = await solicitudHttps('POST', 'https://oauth2.googleapis.com/token', {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        cuerpo: formulario({
+            code: String(req.query.code || ''),
+            client_id: GOOGLE_CLIENT_ID,
+            client_secret: GOOGLE_CLIENT_SECRET,
+            redirect_uri: GOOGLE_REDIRECT,
+            grant_type: 'authorization_code'
+        })
+    });
+
+    if (r.status !== 200 || !r.json?.refresh_token) {
+        console.error('Error obteniendo permiso de Google:', r.status, r.json?.error || r.texto.slice(0, 200));
+        return res.send(paginaSimple('No se conectó', 'Google no devolvió el permiso permanente. Pedí otro link e intentá de nuevo.', false));
+    }
+
+    const email = emailDesdeIdToken(r.json.id_token || '');
+    if (email !== GOOGLE_CUENTA) {
+        return res.send(paginaSimple('Cuenta incorrecta',
+            `Iniciaste sesión con ${email || 'otra cuenta'}. Solo se acepta ${GOOGLE_CUENTA}. Pedí otro link e iniciá sesión con esa cuenta.`, false));
+    }
+
+    try {
+        await guardarConfig('google_refresh_token', r.json.refresh_token);
+        await guardarConfig('google_cuenta', email);
+        tokenGoogle = { access_token: r.json.access_token, vence: Date.now() + (r.json.expires_in || 3600) * 1000 };
+    } catch (e) {
+        return res.send(paginaSimple('No se guardó', `No se pudo guardar el permiso en la base de datos: ${e.message}`, false));
+    }
+
+    console.log(`✅ Google Calendar conectado con ${email}`);
+    if (socketActual && ADMIN_NUMBER) {
+        socketActual.sendMessage(await obtenerJidAdmin(socketActual), {
+            text: `✅ Google Calendar conectado con ${email}.\n\nProbá con "ADMIN AGENDA" o "ADMIN PRUEBA REUNION".`
+        }).catch(() => {});
+    }
+    res.send(paginaSimple('Google Calendar conectado', `El bot ya puede usar la agenda de ${email}. Podés cerrar esta página.`, true));
+});
 
 // ---------- Reglas del administrador (guardadas en la base) ----------
 
@@ -525,7 +803,7 @@ async function avisarFallaRespuesta(sock, sender, numero, text) {
 
 // ---------- Comandos del administrador ----------
 
-const REGEX_COMANDO_ADMIN = /^ADMIN(:|\s+LISTAR$|\s+BORRAR(\s+\d+)?$|\s+ESTADO$|\s+MODELOS$)/i;
+const REGEX_COMANDO_ADMIN = /^ADMIN(:|\s+LISTAR$|\s+BORRAR(\s+\d+)?$|\s+ESTADO$|\s+MODELOS$|\s+CONECTAR\s+GOOGLE$|\s+AGENDA$|\s+PRUEBA\s+REUNION$|\s+AYUDA$)/i;
 
 // Lista los modelos de Gemini que acepta esta clave, para elegir el de respaldo.
 function listarModelos() {
@@ -580,6 +858,14 @@ async function estadoSistema() {
     if (GEMINI_MODELOS_RESPALDO.length) lineas.push(`   • Respaldo: ${GEMINI_MODELOS_RESPALDO.join(', ')}`);
     if (ultimoErrorGemini) lineas.push(`   • Último error: ${ultimoErrorGemini.status} a las ${formatoFecha(ultimoErrorGemini.en)}`);
 
+    if (!googleConfigurado()) {
+        lineas.push('📅 Google Calendar: ❌ faltan GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET en Railway');
+    } else if (!(await leerConfig('google_refresh_token'))) {
+        lineas.push('📅 Google Calendar: ⚠️ sin conectar (mandá "ADMIN CONECTAR GOOGLE")');
+    } else {
+        const ok = await obtenerTokenGoogle();
+        lineas.push(`📅 Google Calendar: ${ok ? `✅ conectado (${await leerConfig('google_cuenta')})` : '❌ el permiso falló, volvé a conectar'}`);
+    }
     lineas.push(`📋 Reglas de administrador: ${globalAdminRules.length}`);
     lineas.push(`🔐 Sesión de WhatsApp en: ${AUTH_FOLDER}`);
     lineas.push(`⏱️ Encendido desde: ${formatoFecha(iniciadoEn)}`);
@@ -591,6 +877,63 @@ async function procesarComandoAdmin(sock, sender, text) {
 
     if (/^ADMIN\s+ESTADO$/i.test(comando)) {
         await sock.sendMessage(sender, { text: await estadoSistema() });
+        return;
+    }
+
+    if (/^ADMIN\s+AYUDA$/i.test(comando)) {
+        await sock.sendMessage(sender, { text:
+            '🛠️ *Comandos de administrador*\n\n' +
+            '• ADMIN ESTADO: estado de WhatsApp, base, Gemini y agenda\n' +
+            '• ADMIN MODELOS: modelos de Gemini disponibles\n' +
+            '• ADMIN CONECTAR GOOGLE: link para conectar Google Calendar\n' +
+            '• ADMIN AGENDA: reuniones de los próximos 7 días\n' +
+            '• ADMIN PRUEBA REUNION: crea una reunión de prueba con Meet\n' +
+            '• ADMIN: [regla]: agrega una regla al bot\n' +
+            '• ADMIN LISTAR / ADMIN BORRAR [n]: ver o borrar reglas'
+        });
+        return;
+    }
+
+    if (/^ADMIN\s+CONECTAR\s+GOOGLE$/i.test(comando)) {
+        if (!googleConfigurado()) {
+            await sock.sendMessage(sender, { text: '⚠️ Faltan GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET en las variables de Railway.' });
+            return;
+        }
+        const enlace = crearEnlaceConexionGoogle();
+        await sock.sendMessage(sender, { text:
+            '📅 *Conectar Google Calendar*\n\n' +
+            `1. Abrí este link (vale 15 minutos y una sola vez):\n${enlace}\n\n` +
+            `2. Iniciá sesión con *${GOOGLE_CUENTA}*.\n` +
+            '3. Si aparece "Google no verificó esta app", tocá *Configuración avanzada* → *Ir a Bot Estudio Jaime Irigoyen*.\n' +
+            '4. Aceptá los permisos.\n\nCuando termine te aviso por acá.'
+        });
+        return;
+    }
+
+    if (/^ADMIN\s+AGENDA$/i.test(comando)) {
+        const eventos = await eventosProximos(7);
+        if (!eventos) {
+            await sock.sendMessage(sender, { text: '⚠️ No pude leer la agenda. Revisá con "ADMIN ESTADO" que Google Calendar esté conectado.' });
+            return;
+        }
+        const texto = eventos.length
+            ? '📅 *Próximos 7 días*\n\n' + eventos.map(e => `• ${horaCorta(e.start.dateTime || e.start.date)}: ${e.summary || '(sin título)'}`).join('\n')
+            : '📅 No hay eventos en los próximos 7 días.';
+        await sock.sendMessage(sender, { text: texto });
+        return;
+    }
+
+    if (/^ADMIN\s+PRUEBA\s+REUNION$/i.test(comando)) {
+        const evento = await crearEventoConMeet({
+            titulo: 'Prueba del bot (se puede borrar)',
+            descripcion: 'Reunión de prueba creada por el bot de WhatsApp del Estudio.',
+            inicio: fechaBA(1, 12, 0),
+            fin: fechaBA(1, 12, 45)
+        });
+        const texto = evento
+            ? `✅ Reunión de prueba creada para mañana a las 12:00.\n\n🎥 Meet: ${evento.meet || 'no se generó link'}\n📅 Evento: ${evento.link}\n\nPodés borrarla del calendario.`
+            : '⚠️ No se pudo crear la reunión. Revisá con "ADMIN ESTADO" que Google Calendar esté conectado.';
+        await sock.sendMessage(sender, { text: texto });
         return;
     }
 
@@ -762,4 +1105,4 @@ app.listen(PORT, async () => {
     setTimeout(connectToWhatsApp, 5000);
 });
 
-module.exports = { limpiarNombre, filasAHistorial, numeroCliente, soloDigitos };
+module.exports = { limpiarNombre, filasAHistorial, numeroCliente, soloDigitos, fechaBA, emailDesdeIdToken, horaCorta };
