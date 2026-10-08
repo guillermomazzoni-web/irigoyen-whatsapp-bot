@@ -938,8 +938,8 @@ function construirInstrucciones() {
         '7. Sé conciso: máximo 2 a 3 oraciones breves. Estás respondiendo por WhatsApp.\n' +
         '8. Servicios del Estudio: constitución de sociedades, mantenimiento societario (balances, asambleas ordinarias y extraordinarias, cambio de autoridades y gerencias), transferencias y procesos de disolución y cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.\n' +
         '9. REUNIONES: cuando ya sepas el nombre y de qué se trata la consulta, ofrecé una reunión sin cargo de 30 minutos por Google Meet con un asesor del Estudio. ' +
-        'Para ofrecer horarios usá SIEMPRE la herramienta consultar_horarios: nunca inventes días ni horas. Presentá las opciones numeradas. ' +
-        'Cuando el cliente elija una, usá solicitar_turno con la fecha y hora exactas de esa opción. Después decile que estás verificando la disponibilidad del asesor y que en breve le confirmás. ' +
+        'Para ofrecer horarios usá SIEMPRE la herramienta consultar_horarios: nunca inventes días ni horas. Presentá las opciones numeradas y pedí que responda solo con el número (1, 2 o 3). ' +
+        'Cuando el cliente elija una (por número, día u hora), usá solicitar_turno indicando el número de esa opción en "opcion". Después decile que estás verificando la disponibilidad del asesor y que en breve le confirmás. ' +
         'NUNCA digas que la reunión está confirmada: la confirmación la envía el sistema por separado.\n' +
         '10. Si el cliente tiene dudas sobre un presupuesto que ya recibió y no podés resolverlas, ofrecé una reunión de dudas de 15 minutos (tipo "dudas"), que tiene prioridad.\n' +
         '11. Si el cliente tiene un turno y quiere confirmar asistencia, cancelarlo o responder a un horario que le propuso el asesor, usá las herramientas correspondientes. Para cambiar el horario de un turno: cancelalo y ofrecé horarios nuevos.' +
@@ -965,13 +965,14 @@ const HERRAMIENTAS_CLIENTE = [
         parameters: {
             type: 'OBJECT',
             properties: {
-                fecha: { type: 'STRING', description: 'Fecha del horario elegido, formato AAAA-MM-DD.' },
-                hora: { type: 'STRING', description: 'Hora del horario elegido, formato HH:MM (24 hs).' },
+                opcion: { type: 'INTEGER', description: 'Número de la opción que eligió el cliente (1, 2, 3...) de la última lista ofrecida. Es la forma preferida.' },
+                fecha: { type: 'STRING', description: 'Solo si el cliente pidió un horario que no está en la lista: fecha AAAA-MM-DD.' },
+                hora: { type: 'STRING', description: 'Solo si el cliente pidió un horario que no está en la lista: hora HH:MM (24 hs).' },
                 tipo: { type: 'STRING', enum: ['consulta', 'dudas'] },
                 producto: { type: 'STRING', enum: ['SAS', 'SRL', 'SA', 'Otra consulta'], description: 'Producto o tema principal de la consulta.' },
                 motivo: { type: 'STRING', description: 'Resumen breve de la consulta del cliente.' }
             },
-            required: ['fecha', 'hora', 'tipo', 'producto']
+            required: ['tipo', 'producto']
         }
     },
     {
@@ -995,6 +996,37 @@ const HERRAMIENTAS_CLIENTE = [
     }
 ];
 
+// Últimas opciones ofrecidas a cada cliente, para que pueda elegir por número sin depender de que el modelo
+// reconstruya la fecha (las opciones se muestran sin año).
+async function guardarOpcionesOfrecidas(telefono, opciones, tipo) {
+    await guardarConfig(`opciones:${telefono}`, JSON.stringify({
+        tipo, creadas: Date.now(),
+        opciones: opciones.map(o => ({ inicio: o.inicio.toISOString(), texto: etiquetaTurno(o.inicio) }))
+    })).catch(() => {});
+}
+
+async function leerOpcionesOfrecidas(telefono) {
+    try {
+        const v = JSON.parse(await leerConfig(`opciones:${telefono}`) || 'null');
+        if (!v || Date.now() - v.creadas > 2 * 24 * 3600000) return null;
+        return v;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Interpreta el horario elegido: por número de opción, o por fecha y hora (tolerando un año mal puesto).
+function resolverHorarioElegido(args, ofrecidas, libres) {
+    if (args.opcion && ofrecidas?.opciones?.[args.opcion - 1]) return new Date(ofrecidas.opciones[args.opcion - 1].inicio);
+    const hora = normalizarHora(args.hora);
+    if (!hora) return null;
+    const m = String(args.fecha || '').match(/(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})[\/-](\d{1,2})(?:[\/-](\d{2,4}))?/);
+    if (!m) return null;
+    const dia = Number(m[3] || m[4]), mes = Number(m[2] || m[5]);
+    const candidatos = [...(ofrecidas?.opciones || []).map(o => new Date(o.inicio)), ...(libres || []).map(l => l.inicio)];
+    return candidatos.find(c => { const p = partesBA(c); return p.dia === dia && p.mes === mes && p.hora === hora; }) || null;
+}
+
 async function ejecutarHerramientaCliente(telefono, nombre, args) {
     try {
         if (nombre === 'consultar_horarios') {
@@ -1005,22 +1037,31 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             if (!libres) return { error: 'La agenda no está disponible en este momento. Decile que un asesor lo contactará para coordinar.' };
             const opciones = elegirOpciones(libres, tipo);
             if (!opciones.length) return { error: 'No hay horarios libres en los próximos días. Decile que un asesor lo contactará para coordinar.' };
-            return { opciones: opciones.map(o => ({ fecha: o.fecha, hora: partesBA(o.inicio).hora, texto: etiquetaTurno(o.inicio) })) };
+            await guardarOpcionesOfrecidas(telefono, opciones, tipo);
+            return {
+                opciones: opciones.map((o, i) => ({ opcion: i + 1, texto: etiquetaTurno(o.inicio) })),
+                indicacion: 'Mostralas numeradas con el mismo número. Cuando el cliente elija, llamá a solicitar_turno con ese número en "opcion".'
+            };
         }
 
         if (nombre === 'solicitar_turno') {
-            const tipo = args.tipo === 'dudas' ? 'dudas' : 'consulta';
-            const hora = normalizarHora(args.hora);
-            if (!/^\d{4}-\d{2}-\d{2}$/.test(args.fecha || '') || !hora) return { error: 'Fecha u hora inválida.' };
+            const ofrecidas = await leerOpcionesOfrecidas(telefono);
+            const tipo = args.tipo === 'dudas' ? 'dudas' : (ofrecidas?.tipo || 'consulta');
             if (await turnoActivoCliente(telefono)) return { error: 'El cliente ya tiene un turno activo.' };
-            const inicio = desdeBA(args.fecha, hora);
             const libres = await horariosLibres({ tipo });
             if (!libres) return { error: 'La agenda no está disponible. Decile que un asesor lo contactará.' };
+            const inicio = resolverHorarioElegido(args, ofrecidas, libres);
+            if (!inicio) return { error: 'No pude identificar el horario elegido. Pedile que indique el número de opción.' };
             if (!libres.some(l => l.inicio.getTime() === inicio.getTime())) {
                 const opciones = elegirOpciones(libres, tipo);
-                return { error: 'Ese horario ya no está disponible.', opciones: opciones.map(o => ({ fecha: o.fecha, hora: partesBA(o.inicio).hora, texto: etiquetaTurno(o.inicio) })) };
+                await guardarOpcionesOfrecidas(telefono, opciones, tipo);
+                return {
+                    error: `El horario ${etiquetaTurno(inicio)} ya no está disponible.`,
+                    opciones: opciones.map((o, i) => ({ opcion: i + 1, texto: etiquetaTurno(o.inicio) }))
+                };
             }
             const t = await crearPedidoTurno({ telefono, inicio, tipo, producto: args.producto, motivo: args.motivo });
+            await borrarConfig(`opciones:${telefono}`).catch(() => {});
             return { ok: true, estado: 'pendiente de confirmación del asesor', horario: etiquetaTurno(t.inicio) };
         }
 
@@ -1059,6 +1100,36 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
     return { error: 'Herramienta desconocida.' };
 }
 
+// Si el cliente responde solo con el número de una opción ofrecida, se pide el turno directamente.
+const REGEX_ELECCION = /^\s*(?:(?:la|el)\s+)?(?:opci[oó]n\s*)?(?:n(?:[uú]mero|ro\.?|°|º)?\s*)?([1-9])\s*[.!)]?\s*(?:por favor|gracias)?\s*$/i;
+
+function detectarProducto(textos) {
+    const t = textos.join(' ').toUpperCase();
+    if (/\bS\.?\s?A\.?\s?S\b/.test(t)) return 'SAS';
+    if (/\bS\.?\s?R\.?\s?L\b/.test(t)) return 'SRL';
+    if (/\bS\.?\s?A\b|SOCIEDAD AN[OÓ]NIMA/.test(t)) return 'SA';
+    return 'Otra consulta';
+}
+
+async function eleccionDirecta(telefono, texto) {
+    const m = String(texto || '').match(REGEX_ELECCION);
+    if (!m) return null;
+    const ofrecidas = await leerOpcionesOfrecidas(telefono);
+    if (!ofrecidas) return null;
+    const numero = Number(m[1]);
+    if (!ofrecidas.opciones[numero - 1]) {
+        return `Por favor, indíquenos un número entre 1 y ${ofrecidas.opciones.length}:\n\n${ofrecidas.opciones.map((o, i) => `${i + 1}. ${o.texto}`).join('\n')}`;
+    }
+    const previos = (mensajesCliente.get(telefono) || []).slice(-8, -1);
+    const r = await ejecutarHerramientaCliente(telefono, 'solicitar_turno', {
+        opcion: numero, tipo: ofrecidas.tipo, producto: detectarProducto(previos),
+        motivo: previos.filter(p => p.length > 15).slice(-2).join(' / ').slice(0, 300) || null
+    });
+    if (r.ok) return `Perfecto. Estoy verificando la disponibilidad del asesor para el ${r.horario}. En breve le confirmo.`;
+    if (r.opciones) return `${r.error} Le puedo ofrecer:\n\n${r.opciones.map(o => `${o.opcion}. ${o.texto}`).join('\n')}\n\nIndíquenos el número de su preferencia.`;
+    return null; // que lo resuelva la conversación normal
+}
+
 async function contextoCliente(telefono) {
     const partes = [`Fecha y hora actual en Buenos Aires: ${etiquetaTurno(new Date())}.`];
     try {
@@ -1066,6 +1137,11 @@ async function contextoCliente(telefono) {
         if (t) {
             const estados = { pendiente_admin: 'pendiente de confirmación del asesor', propuesto: 'propuesto por el asesor, esperando respuesta del cliente', confirmado: 'confirmado' };
             partes.push(`Este cliente tiene un turno ${estados[t.estado]}: ${etiquetaTurno(t.inicio)}${t.meet ? `, link ${t.meet}` : ''}${t.asistencia_confirmada ? ', asistencia confirmada' : ''}.`);
+        }
+        const ofrecidas = await leerOpcionesOfrecidas(telefono);
+        if (ofrecidas && !t) {
+            partes.push(`Opciones de horario ofrecidas a este cliente (si elige una, usá solicitar_turno con ese número en "opcion"):\n` +
+                ofrecidas.opciones.map((o, i) => `${i + 1}. ${o.texto}`).join('\n'));
         }
     } catch (e) { /* sin contexto de turnos */ }
     return partes.join('\n');
@@ -1268,6 +1344,9 @@ async function consultarGemini(remitenteId, mensajeTexto) {
     const base = previo ? historial.slice(0, -1) : historial;
     const textoUsuario = previo ? previo.parts[0].text + '\n' + mensajeTexto : mensajeTexto;
     const mensajeUsuario = { role: 'user', parts: [{ text: textoUsuario }] };
+
+    const directa = await eleccionDirecta(remitenteId, mensajeTexto).catch(e => { console.error('Elección directa:', e.message); return null; });
+    if (directa) return directa;
 
     const instrucciones = construirInstrucciones() + '\n\nCONTEXTO ACTUAL:\n' + await contextoCliente(remitenteId);
     const reply = await conversarConHerramientas({
