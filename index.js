@@ -1049,13 +1049,21 @@ async function enviarACliente(telefono, texto) {
     userHistories.delete(telefono); // se recarga desde la base en el próximo mensaje
 }
 
-async function enviarAAdmin(texto) {
+// anotar: el aviso queda también en la conversación del asistente admin (para que sepa de quién se habla).
+async function enviarAAdmin(texto, { anotar = false } = {}) {
     if (!socketActual || !ADMIN_NUMBER) return;
     try {
         await socketActual.sendMessage(await obtenerJidAdmin(socketActual), { text: texto });
+        if (anotar) anotarAvisoEnHistorialAdmin(texto);
     } catch (e) {
         console.error('Error enviando mensaje al administrador:', e.message);
     }
+}
+
+// Cómo se nombra a un contacto en los avisos: nombre y teléfono (para poder referirse a él sin confusiones).
+function etiquetaContacto(c, fallback = 'Un cliente') {
+    const nombre = c?.nombre && c.nombre !== 'No indicado' ? c.nombre : fallback;
+    return `${nombre}${c?.numero ? ` (+${c.numero})` : ''}`;
 }
 
 function textoAvisoTurno(t, { segundo = false, email = null, esCliente = false } = {}) {
@@ -1073,7 +1081,7 @@ function textoAvisoTurno(t, { segundo = false, email = null, esCliente = false }
 
 async function avisarPedidoAlAdmin(t, segundo = false) {
     const contacto = await obtenerContacto(t.telefono);
-    await enviarAAdmin(textoAvisoTurno(t, { segundo, email: contacto?.email || null, esCliente: contacto?.es_cliente }));
+    await enviarAAdmin(textoAvisoTurno(t, { segundo, email: contacto?.email || null, esCliente: contacto?.es_cliente }), { anotar: true });
 }
 
 function textoAgendaYLink(t) {
@@ -1101,7 +1109,7 @@ async function modificarPedido(t, inicio) {
     const nuevo = await obtenerTurno(t.id);
     const contacto = await obtenerContacto(t.telefono);
     await enviarAAdmin(`✏️ ${t.nombre || 'El cliente'} cambió el horario de su pedido #${t.id}: antes ${etiquetaTurno(t.inicio)}, ahora ${etiquetaTurno(inicio)}.\n\n` +
-        textoAvisoTurno(nuevo, { email: contacto?.email || null, esCliente: contacto?.es_cliente }));
+        textoAvisoTurno(nuevo, { email: contacto?.email || null, esCliente: contacto?.es_cliente }), { anotar: true });
     return nuevo;
 }
 
@@ -1442,14 +1450,52 @@ async function agendarReunion({ cliente, turno_id, fecha, hora, tema, consultar_
     return r.ok ? { ok: true, mensaje: `Listo, agendé una reunión nueva para ${nombre || 'el cliente'} el ${etiquetaTurno(inicio)} (turno #${t.id}) y le avisé. Meet creado.` } : r;
 }
 
-// El asesor decide no tomar una consulta que no es de sociedades.
-async function rechazarConsulta({ cliente }) {
+// Consultas "para evaluar" que esperan la decisión del asesor.
+async function consultasEnEvaluacion() {
+    const { rows } = await db.query(`SELECT clave, valor FROM configuracion WHERE clave LIKE 'evaluacion:%'`);
+    const lista = [];
+    for (const r of rows) {
+        try {
+            const v = JSON.parse(r.valor);
+            if (Date.now() - v.creada > 7 * 24 * 3600000) continue;
+            const telefono = r.clave.slice('evaluacion:'.length);
+            lista.push({ telefono, ...v, contacto: await obtenerContacto(telefono) });
+        } catch (e) { /* ignorar */ }
+    }
+    return lista;
+}
+
+async function contactoDeConsulta({ cliente, telefono }) {
+    if (telefono) return { telefono, ...(await obtenerContacto(telefono) || {}) };
     const c = await buscarContacto(cliente);
+    return c;
+}
+
+// El asesor acepta una consulta que no es de sociedades: se le ofrecen horarios al cliente (y el pedido vuelve al asesor
+// para que lo confirme, como siempre).
+async function aceptarConsulta({ cliente, telefono }) {
+    const c = await contactoDeConsulta({ cliente, telefono });
+    if (c.error) return { ok: false, mensaje: c.error };
+    const evaluacion = await leerConfigJSON(`evaluacion:${c.telefono}`, 30);
+    if (!evaluacion) return { ok: false, mensaje: `${etiquetaContacto(c, 'Ese contacto')} no tiene ninguna consulta en evaluación.` };
+    const libres = await horariosLibres({ tipo: 'consulta' });
+    const opciones = libres ? elegirOpciones(libres, 'consulta') : [];
+    if (!opciones.length) return { ok: false, mensaje: 'No encontré horarios libres en los próximos días. Decime un día y hora y se la agendo.' };
+    await guardarDatosConsulta(c.telefono, { especialidad: 'Otra consulta', motivo: `${evaluacion.area}: ${evaluacion.resumen}`, completo: true, proposito: 'nueva' });
+    await guardarOpcionesOfrecidas(c.telefono, opciones, 'consulta');
+    await borrarConfig(`evaluacion:${c.telefono}`).catch(() => {});
+    await enviarACliente(c.telefono, `Le comentamos que un asesor del Estudio puede ayudarle con su consulta sobre ${evaluacion.area}. Le propongo coordinar una reunión sin cargo por Google Meet:\n\n${textoOpciones(opciones)}\n\nIndíquenos el número de su preferencia.`);
+    return { ok: true, mensaje: `Listo, le avisé a ${etiquetaContacto(c, 'el cliente')} que tomamos su consulta sobre ${evaluacion.area} y le ofrecí 3 horarios. Cuando elija, te llega el pedido para confirmar.` };
+}
+
+// El asesor decide no tomar una consulta que no es de sociedades.
+async function rechazarConsulta({ cliente, telefono }) {
+    const c = await contactoDeConsulta({ cliente, telefono });
     if (c.error) return { ok: false, mensaje: c.error };
     const evaluacion = await leerConfigJSON(`evaluacion:${c.telefono}`, 30);
     await borrarConfig(`evaluacion:${c.telefono}`).catch(() => {});
     await enviarACliente(c.telefono, `Le agradecemos mucho su consulta${evaluacion ? ` sobre ${evaluacion.area}` : ''}. Lamentablemente no es un tema que el Estudio pueda tomar en este momento; le recomendamos consultar con un profesional especializado. Quedamos a su disposición para cualquier consulta de sociedades.`);
-    return { ok: true, mensaje: `Listo, le avisé a ${c.nombre || 'el cliente'} con amabilidad que no tomamos su consulta.` };
+    return { ok: true, mensaje: `Listo, le avisé a ${etiquetaContacto(c, 'el cliente')} con amabilidad que no tomamos su consulta.` };
 }
 
 // El administrador le escribe a un cliente; su primera respuesta (y lo que mande en los 5 minutos siguientes) se le reenvía.
@@ -1621,7 +1667,8 @@ const HERRAMIENTAS_CLIENTE = [
             properties: {
                 area: { type: 'STRING', description: 'Rama del derecho, por ejemplo "sucesiones", "laboral", "contratos", "civil", "penal", "accidentes", "familia".' },
                 resumen: { type: 'STRING', description: 'Resumen claro de lo que necesita el cliente, con los datos que dio (situación, si ya hay algo iniciado, urgencia).' },
-                urgencia: { type: 'STRING', description: 'Para cuándo lo necesita, si lo dijo.' }
+                urgencia: { type: 'STRING', description: 'Para cuándo lo necesita, si lo dijo.' },
+                nombre_cliente: { type: 'STRING', description: 'Nombre y apellido del cliente, si todavía no lo tenemos guardado.' }
             },
             required: ['area', 'resumen']
         }
@@ -1756,7 +1803,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
                 }
                 const tema = [args.especialidad && args.especialidad !== t.producto ? args.especialidad : null, detalle].filter(Boolean).join(': ');
                 await actualizarTurno(t.id, { motivo: `${t.motivo || ''}${t.motivo ? ' | ' : ''}Tema adicional: ${tema}`.slice(0, 1000) });
-                await enviarAAdmin(`📌 ${t.nombre || 'Un cliente'} agregó un tema a su reunión #${t.id} (${etiquetaTurno(t.inicio)}): ${tema}`);
+                await enviarAAdmin(`📌 ${t.nombre || 'Un cliente'} agregó un tema a su reunión #${t.id} (${etiquetaTurno(t.inicio)}): ${tema}`, { anotar: true });
                 return { ok: true, tema_agregado: true, indicacion: `Decile que sumamos ese tema a su reunión del ${etiquetaTurno(t.inicio)}, así el asesor lo ve todo en el mismo encuentro. No ofrezcas otros horarios.` };
             }
             const separada = activos.length > 0 && args.proposito === 'otro_tema' && esCliente;
@@ -1865,17 +1912,25 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
 
         if (nombre === 'derivar_consulta') {
             const area = normalizarTexto(args.area);
-            const quien = contacto?.nombre && contacto.nombre !== 'No indicado' ? contacto.nombre : 'Un cliente';
+            // Antes de pasarle la consulta al asesor hace falta el nombre del cliente.
+            let ficha = contacto;
+            if (!(ficha?.nombre && ficha.nombre !== 'No indicado')) {
+                const dado = limpiarNombre(args.nombre_cliente || '');
+                if (!dado) return { error: 'Antes de pasarle la consulta al asesor, preguntale su nombre y apellido (y volvé a llamar con "nombre_cliente").' };
+                await db.query(`INSERT INTO contactos (telefono, nombre) VALUES ($1, $2) ON CONFLICT (telefono) DO UPDATE SET nombre = EXCLUDED.nombre`, [telefono, dado]);
+                ficha = await obtenerContacto(telefono);
+            }
+            const quien = etiquetaContacto(ficha);
             // Se decide por el área (no por el resumen: "mi familia" puede aparecer en una sucesión).
             const noAtendida = /penal|delito|imputad|detenid|carcel/.test(area) ? 'penal'
                 : /accident|choque|siniestro/.test(area) ? 'accidentes'
                 : /familia|divorc|alimento|tenencia|cuidado personal|regimen de (visita|comunicacion)|adopci|violencia/.test(area) ? 'familia' : null;
             if (noAtendida) {
-                await enviarAAdmin(`ℹ️ ${quien}${contacto?.numero ? ` (+${contacto.numero})` : ''} consultó por un tema de ${noAtendida} (no lo atendemos). Se lo dije con amabilidad.\n📝 ${args.resumen}`);
+                await enviarAAdmin(`ℹ️ ${quien} consultó por un tema de ${noAtendida} (no lo atendemos). Se lo dije con amabilidad.\n📝 ${args.resumen}`, { anotar: true });
                 return { ok: true, no_atendida: noAtendida, indicacion: `Decile con amabilidad que el Estudio no trabaja temas de ${noAtendida} y que le recomendamos consultar con un profesional especializado. No ofrezcas horarios. Si tiene alguna consulta de sociedades, con gusto lo ayudamos.` };
             }
             await guardarConfig(`evaluacion:${telefono}`, JSON.stringify({ area: args.area, resumen: args.resumen, urgencia: args.urgencia || null, creada: Date.now() }));
-            await enviarAAdmin(`⚖️ *Consulta para evaluar* · ${args.area}\n\n👤 ${quien}${contacto?.numero ? ` (+${contacto.numero})` : ''}${esCliente ? ' · ⭐ Cliente' : ''}\n📝 ${args.resumen}${args.urgencia ? `\n⏱️ ${args.urgencia}` : ''}\n\n¿La atendemos? Si sí, decime por ejemplo "agendale una reunión el jueves a las 17:15". Si no, decime "no la atendemos".`);
+            await enviarAAdmin(`⚖️ *Consulta para evaluar* · ${args.area}\n\n👤 ${quien}${esCliente ? ' · ⭐ Cliente' : ''}\n📝 ${args.resumen}${args.urgencia ? `\n⏱️ ${args.urgencia}` : ''}\n\n¿La atendemos? Respondé *sí* y le ofrezco horarios, o decime un día y hora para agendarla. Si no, decime *no*.`, { anotar: true });
             return { ok: true, en_evaluacion: true, indicacion: 'Decile que le pasamos su consulta al asesor para evaluarla y que nos comunicaremos a la brevedad. NO ofrezcas horarios ni prometas que se va a atender.' };
         }
 
@@ -2634,6 +2689,10 @@ const HERRAMIENTAS_ADMIN = [
             consultar_cliente: { type: 'BOOLEAN', description: 'true para proponérsela en lugar de confirmarla.' } }, required: ['fecha', 'hora'] }
     },
     {
+        name: 'atender_consulta', description: 'Acepta una "⚖️ Consulta para evaluar": le avisa al cliente que el asesor puede ayudarlo y le ofrece horarios (después el pedido vuelve para que lo confirmes). Si el administrador da un día y hora, usá agendar_reunion en su lugar.',
+        parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono del cliente, tal como figura en el aviso.' } }, required: ['cliente'] }
+    },
+    {
         name: 'no_atender_consulta', description: 'El Estudio decide no tomar una consulta que no es de sociedades: le avisa al cliente con amabilidad.',
         parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono del cliente.' } }, required: ['cliente'] }
     },
@@ -2669,13 +2728,20 @@ const HERRAMIENTAS_ADMIN = [
     }
 ];
 
-const HERRAMIENTAS_SENSIBLES = new Set(['confirmar', 'rechazar', 'proponer_horario', 'mover_reunion', 'descartar_cambio', 'cancelar_turno', 'cambiar_duracion', 'escribir_al_cliente', 'borrar_regla', 'agendar_reunion', 'no_atender_consulta']);
+const HERRAMIENTAS_SENSIBLES = new Set(['confirmar', 'rechazar', 'proponer_horario', 'mover_reunion', 'descartar_cambio', 'cancelar_turno', 'cambiar_duracion', 'escribir_al_cliente', 'borrar_regla', 'agendar_reunion', 'atender_consulta', 'no_atender_consulta']);
 // Herramientas con una hora: la hora tiene que haberla dicho el administrador o el cliente.
 const CON_HORA = { proponer_horario: 'hora', mover_reunion: 'hora', agendar_reunion: 'hora', escribir_al_cliente: 'propuesta_hora', cambiar_duracion: 'hasta' };
 const CON_TURNO = new Set(['confirmar', 'rechazar', 'proponer_horario', 'mover_reunion', 'descartar_cambio', 'cancelar_turno', 'cambiar_duracion']);
 const VIGENCIA_ACCION_MIN = 30;
 let historialAdmin = [];
 let ultimoMensajeAdmin = 0;
+
+// Nombre y teléfono del cliente para mostrar en la confirmación (así se ve a quién va).
+async function nombreParaConfirmar(args) {
+    if (!args.cliente) return 'el cliente';
+    const c = await buscarContacto(args.cliente).catch(() => null);
+    return c && !c.error ? etiquetaContacto(c) : args.cliente;
+}
 
 async function describirAccion(nombre, args) {
     const turno = args.turno_id ? await obtenerTurno(args.turno_id) : null;
@@ -2711,8 +2777,9 @@ async function describirAccion(nombre, args) {
             const f = interpretarFecha(args.fecha), h = normalizarHora(args.hora);
             return `${args.consultar_cliente ? 'proponerle' : 'agendarle'} a ${turno?.nombre || args.cliente || 'el cliente'} una reunión NUEVA el ${f && h ? etiquetaTurno(desdeBA(f, h)) : '(horario sin definir)'}${args.tema ? ` (${args.tema})` : ''}${args.consultar_cliente ? '' : ', crear el Meet y avisarle'}`;
         }
-        case 'no_atender_consulta': return `avisarle a ${args.cliente} que el Estudio no toma su consulta`;
-        case 'escribir_al_cliente': return `enviarle a ${turno?.nombre || args.cliente || 'el cliente'} este mensaje por WhatsApp:\n\n«${args.mensaje || ''}»\n\nSi responde, te paso su respuesta`;
+        case 'no_atender_consulta': return `avisarle a ${await nombreParaConfirmar(args)} que el Estudio no toma su consulta`;
+        case 'atender_consulta': return `avisarle a ${await nombreParaConfirmar(args)} que tomamos su consulta y ofrecerle horarios`;
+        case 'escribir_al_cliente': return `enviarle a ${turno ? etiquetaContacto(turno) : await nombreParaConfirmar(args)} este mensaje por WhatsApp:\n\n«${args.mensaje || ''}»\n\nSi responde, te paso su respuesta`;
         case 'borrar_regla': return `borrar la regla ${args.numero}: "${globalAdminRules[args.numero - 1]?.regla || '(no existe)'}"`;
         default: return nombre;
     }
@@ -2741,6 +2808,7 @@ async function ejecutarAccionAdmin(nombre, args) {
         case 'marcar_cliente': return marcarCliente(args.texto, args.es_cliente !== false);
         case 'agendar_reunion': return agendarReunion(args);
         case 'no_atender_consulta': return rechazarConsulta(args);
+        case 'atender_consulta': return aceptarConsulta(args);
         case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
         case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
         case 'restablecer_dia': return restablecerDia(args.fecha);
@@ -2777,6 +2845,7 @@ async function leerAccionPendiente() {
 
 async function instruccionesAdmin() {
     const pendientes = await turnosPendientesAdmin().catch(() => []);
+    const consultas = await consultasEnEvaluacion().catch(() => []);
     return 'Sos el asistente personal del administrador del Estudio Jurídico Jaime Irigoyen, por WhatsApp. ' +
         'Hablás en español rioplatense, de "vos", con tono cercano pero prolijo, claro y breve (2 a 5 líneas salvo que muestres una lista). Nunca uses "che" ni muletillas o expresiones informales.\n' +
         'HONESTIDAD: nunca digas que hiciste, enviaste, avisaste, cambiaste o cancelaste algo si una herramienta no lo hizo y devolvió "ok". Si no tenés una herramienta para lo que te pide, decíselo y ofrecé lo que sí podés hacer. Nunca inventes respuestas de clientes ni afirmes si algo está en Google Calendar sin mirar ver_agenda.\n' +
@@ -2785,7 +2854,8 @@ async function instruccionesAdmin() {
         '- Si el cliente pidió un cambio, "confirmar" lo aplica y "rechazar" lo descarta avisándole que se mantiene su horario.\n' +
         '- Para cambiar el horario de una reunión: si el cliente ya aceptó (respondió que sí, o el administrador dice que ya lo habló), usá mover_reunion con cliente_acepto=true; si todavía no lo sabe, usá proponer_horario o escribir_al_cliente. Nunca canceles una reunión para cambiarla de horario.\n' +
         '- Si el cliente mantiene su horario y hay un cambio que ya no hace falta, usá descartar_cambio (no le avisa nada).\n' +
-        'Para una reunión NUEVA de un cliente (otro tema, o una consulta "⚖️ para evaluar" que decidiste atender) usá agendar_reunion: NUNCA muevas su reunión actual para eso. Si decidís no atender una consulta, usá no_atender_consulta.\n' +
+        'Para una reunión NUEVA de un cliente (otro tema, o una consulta "⚖️ para evaluar" con día y hora) usá agendar_reunion: NUNCA muevas su reunión actual para eso. ' +
+        'Para aceptar una consulta "⚖️ para evaluar" sin día ni hora ("decile que sí") usá atender_consulta; para no tomarla, no_atender_consulta. Identificá al cliente por el nombre o el teléfono que figura en el aviso: nunca lo confundas con otro cliente de la conversación.\n' +
         'HORAS: usá solo una hora que haya dicho el administrador o el cliente (por ejemplo "a las 17:15"). Si dicen "después de la otra reunión" o algo sin hora, preguntá a qué hora, indicando a qué hora termina la reunión actual. Nunca elijas una hora por tu cuenta.\n' +
         'En los mensajes para clientes usá el mismo trato que el bot: "Estimado/a Sr./Sra. Apellido", de usted, en nombre del Estudio.\n' +
         'Para alargar o acortar una reunión usá cambiar_duracion. Para avisarle o preguntarle algo a un cliente usá escribir_al_cliente, redactando en tono formal (si le proponés un horario, completá propuesta_fecha y propuesta_hora).\n' +
@@ -2795,7 +2865,8 @@ async function instruccionesAdmin() {
         'Si te equivocás, reconocelo en una frase y decí qué quedó hecho. No prometas "prestar más atención" ni mejorar: no aprendés solo.\n' +
         'Horario normal de atención: lunes a viernes de 12 a 18 hs. Turnos de 30 min + 15 de margen. Cada pedido trae especialidad, motivo e interés del cliente.\n\n' +
         `Hoy es ${fechaHoyCompleta()}. Tabla de fechas:\n${calendarioReferencia()}\n\n` +
-        (pendientes.length ? `Esperando tu decisión:\n${pendientes.map(descripcionTurno).join('\n')}` : 'No hay pedidos esperando tu decisión.');
+        (pendientes.length ? `Esperando tu decisión:\n${pendientes.map(descripcionTurno).join('\n')}` : 'No hay pedidos esperando tu decisión.') +
+        (consultas.length ? `\nConsultas para evaluar:\n${consultas.map(c => `• ${etiquetaContacto(c.contacto)}: ${c.area} — ${c.resumen}`).join('\n')}` : '');
 }
 
 // Avisos del sistema y acciones hechas con un "sí" directo quedan en la conversación del asistente.
@@ -2827,11 +2898,16 @@ async function procesarMensajeAdmin(sock, sender, text) {
         // cambió de tema: se descarta la acción en espera y sigue la conversación
     }
 
-    // 2) "Sí" o "no" directo cuando hay una sola decisión pendiente.
+    // 2) "Sí" o "no" directo cuando hay una sola decisión pendiente (un pedido o una consulta para evaluar).
     if (esAfirmativo(text) || esNegativo(text)) {
         const pendientes = await turnosPendientesAdmin();
-        if (pendientes.length === 1) {
+        const consultas = await consultasEnEvaluacion();
+        if (pendientes.length === 1 && !consultas.length) {
             const r = esAfirmativo(text) ? await confirmarTurno(pendientes[0].id) : await rechazarTurno(pendientes[0].id);
+            return responder(r.mensaje);
+        }
+        if (consultas.length === 1 && !pendientes.length) {
+            const r = esAfirmativo(text) ? await aceptarConsulta({ telefono: consultas[0].telefono }) : await rechazarConsulta({ telefono: consultas[0].telefono });
             return responder(r.mensaje);
         }
     }
