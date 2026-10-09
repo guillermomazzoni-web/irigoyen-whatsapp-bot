@@ -1813,13 +1813,17 @@ function resolverHorarioElegido(args, ofrecidas) {
 // Un prospecto con otro tema: se suma a la reunión que ya tiene. Devuelve null si el tema todavía es vago.
 function temaConcreto(detalle) {
     detalle = String(detalle || '').trim();
-    if (detalle.length < 12 || /^(otra|otro|nueva|una)?\s*(consulta|reunion|reunión|tema)( general| adicional| mas| más| nueva)?\.?$/i.test(detalle) || /reuni[oó]n adicional|otra consulta|otro tema|consulta general/i.test(detalle)) return null;
+    if (detalle.replace(/[^a-záéíóúñ]/gi, '').length < 5 || /^(otra|otro|nueva|una)?\s*(consulta|reunion|reunión|tema)( general| adicional| mas| más| nueva)?\.?$/i.test(detalle) || /reuni[oó]n adicional|otra consulta|otro tema|consulta general/i.test(detalle)) return null;
     return detalle;
 }
 
 async function sumarTemaAReunion(t, { especialidad, motivo }) {
     const detalle = temaConcreto(motivo);
-    if (!detalle) return { error: 'Todavía no sabés cuál es el otro tema. NO sumes nada ni cambies nada: preguntale con amabilidad de qué se trata concretamente.' };
+    if (!detalle) {
+        await guardarEstadoProposito(t.telefono, { estado: 'tema', proposito: 'otro_tema' });
+        return { error: `Todavía no sabés cuál es el otro tema. NO sumes nada ni digas que lo agregaste. Preguntale SOLO sobre qué tema sería (NO vuelvas a preguntar si quiere cambiar el horario), y explicale que el asesor lo trata en la misma reunión del ${etiquetaTurno(t.inicio)}.` };
+    }
+    await borrarConfig(`proposito:${t.telefono}`).catch(() => {});
     const tema = [especialidad && especialidad !== t.producto ? especialidad : null, detalle].filter(Boolean).join(': ');
     await actualizarTurno(t.id, { motivo: `${t.motivo || ''}${t.motivo ? ' | ' : ''}Tema adicional: ${tema}`.slice(0, 1000) });
     const c = await obtenerContacto(t.telefono);
@@ -1837,13 +1841,36 @@ function reunionACambiar(activos, args) {
 }
 
 // Con una sola reunión, se entiende que es un cambio solo si el cliente lo dice claro o si hay un horario en discusión.
-const REGEX_CAMBIO = /cambi|pasar|pasarla|mover|moverla|correr|reprogram|en vez|en lugar|mejor (a las|el|para)|otro horario|otra hora|no puedo|no me queda|no llego/i;
-const REGEX_OTRO_TEMA = /otra reuni|otro tema|otra consulta|aparte|adem[aá]s|tambi[eé]n (quiero|necesito)|nueva reuni|segunda reuni/i;
-function inferirCambio(vigentes, textos) {
-    if (vigentes.length !== 1) return false;
-    const ultimo = String((textos || []).slice(-1)[0] || '');
-    if (REGEX_OTRO_TEMA.test(ultimo)) return false;
-    return Boolean(leerCambio(vigentes[0])) || REGEX_CAMBIO.test(ultimo);
+// Lo que dice el cliente decide si es un cambio de horario u otro tema (no la interpretación del modelo).
+// "otra reunión / otra consulta / otro tema" vale aunque venga con un "no" adelante ("No, otra reunión").
+const REGEX_OTRO_TEMA = /otr[ao]s? (reuni|consulta|tema|cosa|asunto)|aparte|adem[aá]s|tambi[eé]n (quiero|necesito|tengo)|nueva reuni|segunda reuni|tema (distinto|diferente|nuevo)|(distinto|diferente) tema/i;
+const REGEX_CAMBIO = /cambi|pasar|pasarla|mover|moverla|correr|reprogram|en vez|en lugar|mejor (a las|el|para)|otro horario|otra hora|otro d[ií]a|no puedo|no me queda|no llego/i;
+function propositoDeTexto(texto) {
+    const t = normalizarTexto(texto || '');
+    if (REGEX_OTRO_TEMA.test(t)) return 'otro_tema';
+    if (REGEX_CAMBIO.test(t)) return 'cambio';
+    return null;
+}
+// Último mensaje del cliente con una intención clara, y si fue el último mensaje.
+function resolverProposito({ args, textos, estado, datos, vigentes }) {
+    const ultimo = propositoDeTexto((textos || []).slice(-1)[0]);
+    if (ultimo) return ultimo;
+    if (estado?.proposito) return estado.proposito;
+    if (args.proposito) return args.proposito;
+    const g = propositoGuardado(datos);
+    if (g) return g;
+    if (vigentes.length === 1 && leerCambio(vigentes[0])) return 'cambio';
+    return null;
+}
+
+// Estado de la pregunta "¿cambiar o es otro tema?" (para no repetirla en círculo).
+async function leerEstadoProposito(telefono) {
+    const v = await leerConfigJSON(`proposito:${telefono}`, 1);
+    return v && Date.now() - v.creada < 60 * 60000 ? v : null;
+}
+async function guardarEstadoProposito(telefono, datos) {
+    const previo = await leerEstadoProposito(telefono);
+    await guardarConfig(`proposito:${telefono}`, JSON.stringify({ ...(previo || {}), ...datos, creada: Date.now() }));
 }
 
 function propositoGuardado(datos) {
@@ -1867,16 +1894,19 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
                 return { error: `Su consulta sobre ${evaluacion.area} está en evaluación por el asesor. NO ofrezcas horarios: decile que el asesor lo va a contactar a la brevedad.` };
             }
             // Si ya tiene una reunión, primero hay que saber si quiere cambiarla o si es otro tema.
-            if (activos.length && !args.proposito) {
-                return { pregunta: `El cliente ya tiene ${activos[0].estado === 'confirmado' ? 'una reunión confirmada' : 'un pedido de reunión'} el ${etiquetaTurno(activos[0].inicio)}. NO ofrezcas horarios todavía: preguntale si desea cambiar ese horario o si se trata de otro tema, y volvé a llamar con "proposito".` };
+            const proposito = activos.length ? resolverProposito({ args, textos: mensajesCliente.get(telefono), estado: await leerEstadoProposito(telefono), datos: previa, vigentes: activos }) : null;
+            if (activos.length && !proposito) {
+                await guardarEstadoProposito(telefono, { estado: 'pregunta', veces: ((await leerEstadoProposito(telefono))?.veces || 0) + 1 });
+                return { pregunta: `El cliente ya tiene ${activos[0].estado === 'confirmado' ? 'una reunión confirmada' : 'un pedido de reunión'} el ${etiquetaTurno(activos[0].inicio)}. NO ofrezcas horarios todavía: preguntale UNA vez, con claridad, si desea CAMBIAR ese horario o si es OTRO TEMA.` };
             }
-            if (activos.length && args.proposito === 'otro_tema' && !esCliente) {
+            if (activos.length && proposito === 'otro_tema' && !esCliente) {
                 // Prospecto: el tema nuevo se suma a la misma reunión.
                 return await sumarTemaAReunion(activos[0], args);
             }
-            const separada = activos.length > 0 && args.proposito === 'otro_tema' && esCliente;
+            const separada = activos.length > 0 && proposito === 'otro_tema' && esCliente;
             if (separada && !temaConcreto(args.motivo)) {
-                return { error: 'Para armarle una reunión aparte necesitás saber el tema: preguntale con amabilidad de qué se trata. No cambies la reunión que ya tiene.' };
+                await guardarEstadoProposito(telefono, { estado: 'tema', proposito: 'otro_tema' });
+                return { error: 'Para armarle una reunión aparte necesitás saber el tema: preguntale SOLO sobre qué tema sería (no vuelvas a preguntar si quiere cambiar el horario). Su reunión actual se mantiene.' };
             }
             const esCambio = activos.length > 0 && !separada;
             if (separada) activos = [];
@@ -1918,6 +1948,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             }
             if (!opciones.length) return { error: 'No hay horarios libres en los próximos días. Decile que un asesor lo contactará para coordinar.' };
             await guardarOpcionesOfrecidas(telefono, opciones, tipo);
+            if (activos.length || separada) await borrarConfig(`proposito:${telefono}`).catch(() => {});
             const r = { opciones: listaOpciones(opciones), indicacion: 'Mostralas numeradas con el mismo número y el mismo texto. Cuando el cliente elija, llamá a solicitar_turno con ese número en "opcion".' };
             if (nota) r.nota = nota;
             if (esCambio) r.cambio = `El cliente ya tiene un turno el ${etiquetaTurno(activos[0].inicio)}. Si elige una opción, se envía como pedido de cambio de horario (su reunión actual se mantiene hasta que el asesor confirme).`;
@@ -1930,9 +1961,10 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             const tipo = args.tipo === 'dudas' ? 'dudas' : (ofrecidas?.tipo || 'consulta');
             const datos = await leerDatosConsulta(telefono);
             const vigentes = await turnosActivosCliente(telefono);
-            const proposito = args.proposito || propositoGuardado(datos) || (inferirCambio(vigentes, mensajesCliente.get(telefono)) ? 'cambio' : null);
+            const proposito = vigentes.length ? resolverProposito({ args, textos: mensajesCliente.get(telefono), estado: await leerEstadoProposito(telefono), datos, vigentes }) : null;
             // Nunca se toca una reunión existente sin saber si el cliente quiere cambiarla o si es otro tema.
             if (vigentes.length && !proposito) {
+                await guardarEstadoProposito(telefono, { estado: 'pregunta', veces: ((await leerEstadoProposito(telefono))?.veces || 0) + 1 });
                 return { error: `NO se envió ningún pedido. El cliente ya tiene ${vigentes.length > 1 ? 'reuniones' : (vigentes[0].estado === 'confirmado' ? 'una reunión confirmada' : 'un pedido de reunión')} (${vigentes.map(x => etiquetaTurno(x.inicio)).join(' y ')}). Preguntale si desea CAMBIAR ese horario o si es OTRO TEMA, y volvé a llamar con "proposito".` };
             }
             if (vigentes.length && proposito === 'otro_tema' && !esCliente) {
@@ -1940,6 +1972,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             }
             const separada = vigentes.length > 0 && proposito === 'otro_tema' && esCliente;
             if (separada && !temaConcreto(args.motivo || datos?.motivo)) {
+                await guardarEstadoProposito(telefono, { estado: 'tema', proposito: 'otro_tema' });
                 return { error: 'NO se envió ningún pedido. Para una reunión aparte necesitás saber el tema: preguntale de qué se trata. La reunión que ya tiene no se cambia.' };
             }
             let activos = [];
@@ -1969,6 +2002,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             await borrarConfig(`opciones:${telefono}`).catch(() => {});
             if (actual) {
                 await borrarConfig(`consulta:${telefono}`).catch(() => {});
+                await borrarConfig(`proposito:${telefono}`).catch(() => {});
                 if (actual.estado === 'pendiente_admin') {
                     await modificarPedido(actual, inicio);
                     return { ok: true, estado: 'pedido actualizado, pendiente de confirmación del asesor', horario: etiquetaTurno(inicio), indicacion: 'Decile que actualizaste su pedido y que el asesor le confirma a la brevedad.' };
@@ -1984,6 +2018,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             if (falta) return { error: `NO se envió ningún pedido. ${falta}` };
             const t = await crearPedido({ telefono, inicio, tipo, producto: base.especialidad, motivo: motivoCompleto(base), interes: args.interes || datos?.interes || null });
             await borrarConfig(`consulta:${telefono}`).catch(() => {});
+            await borrarConfig(`proposito:${telefono}`).catch(() => {});
             if (separada) {
                 return { ok: true, estado: 'pedido de reunión APARTE enviado al asesor, pendiente de confirmación', horario: etiquetaTurno(t.inicio), se_mantiene: vigentes.map(x => etiquetaTurno(x.inicio)).join(' y '),
                     indicacion: `Decile que su reunión del ${vigentes.map(x => etiquetaTurno(x.inicio)).join(' y ')} se mantiene, que pediste una reunión aparte para el ${etiquetaTurno(t.inicio)} sobre este tema y que el asesor le confirma a la brevedad.` };
@@ -2180,6 +2215,59 @@ async function eleccionDirecta(telefono, texto) {
     if (r.ok) return `Perfecto. Estoy verificando la disponibilidad del asesor para el ${r.horario}. En breve le confirmo.`;
     if (r.opciones) return `${r.error.replace(' NO se envió ningún pedido.', '')} Le puedo ofrecer:\n\n${r.opciones.map(o => `${o.opcion}. ${o.texto}`).join('\n')}\n\nIndíquenos el número de su preferencia.`;
     return null; // que lo resuelva la conversación normal
+}
+
+// --- "¿Cambiar el horario o es otro tema?": la respuesta la interpreta el sistema, sin vueltas ---
+
+const RELLENO_TEMA = /\b(no|si|sí|es|era|seria|sería|quiero|necesito|quisiera|una|un|unas|otra|otro|otros|otras|reunion|reunión|reuniones|consulta|tema|asunto|cosa|aparte|ademas|además|tambien|también|nueva|nuevo|segunda|distinto|distinta|diferente|para|por|el|la|los|las|de|del|dia|día|a|al|hs|en|y|que|me|mi|sobre|hola|gracias|ok|dale|bueno)\b|\d+([\/:.]\d+)*/gi;
+function extraerTema(texto) {
+    const resto = normalizarTexto(texto || '').replace(RELLENO_TEMA, ' ').replace(/[^a-zñ ]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (resto.replace(/ /g, '').length < 4) return null;
+    return String(texto).trim().replace(/^(no|si|sí)[,.!\s]+/i, '').slice(0, 300);
+}
+
+function preguntaTema(t, esCliente) {
+    return esCliente
+        ? `Perfecto. ¿Sobre qué tema sería? Así le coordino una reunión aparte; su reunión del ${etiquetaTurno(t.inicio)} se mantiene.`
+        : `Perfecto. ¿Sobre qué tema sería? Así el asesor lo trata en la misma reunión del ${etiquetaTurno(t.inicio)} y le da todo junto.`;
+}
+
+async function resolverOtroTema(telefono, vigentes, esCliente, tema) {
+    if (!esCliente) {
+        const r = await sumarTemaAReunion(vigentes[0], { motivo: tema });
+        if (!r.ok) return null;
+        return `Perfecto. Sumamos este tema a su reunión del ${etiquetaTurno(vigentes[0].inicio)}, así el asesor lo trata en el mismo encuentro. Su horario no cambia.`;
+    }
+    const r = await ejecutarHerramientaCliente(telefono, 'consultar_horarios', { tipo: 'consulta', especialidad: 'Otra consulta', motivo: tema, proposito: 'otro_tema' });
+    if (!r.opciones) return null;
+    return `Perfecto. Su reunión del ${vigentes.map(x => etiquetaTurno(x.inicio)).join(' y ')} se mantiene. Para este tema le ofrezco una reunión aparte:\n\n${r.opciones.map(o => `${o.opcion}. ${o.texto}`).join('\n')}\n\nIndíquenos el número de su preferencia.`;
+}
+
+async function propositoDirecto(telefono, texto) {
+    const est = await leerEstadoProposito(telefono);
+    if (!est || (est.estado !== 'pregunta' && est.estado !== 'tema')) return null;
+    const vigentes = await turnosActivosCliente(telefono);
+    if (!vigentes.length) { await borrarConfig(`proposito:${telefono}`); return null; }
+    const esCliente = Boolean((await obtenerContacto(telefono))?.es_cliente);
+    const p = propositoDeTexto(texto);
+    if (p === 'cambio') { await guardarEstadoProposito(telefono, { estado: 'resuelto', proposito: 'cambio' }); return null; } // sigue la conversación normal
+    if (p === 'otro_tema' || est.estado === 'tema') {
+        const tema = /\?\s*$/.test(String(texto).trim()) ? null : extraerTema(texto);
+        if (tema) {
+            const r = await resolverOtroTema(telefono, vigentes, esCliente, tema);
+            if (r) return r;
+            return null;
+        }
+        if (est.estado === 'tema' && !p) return null; // no respondió el tema: que siga la conversación
+        await guardarEstadoProposito(telefono, { estado: 'tema', proposito: 'otro_tema' });
+        return preguntaTema(vigentes[0], esCliente);
+    }
+    // No se entendió la respuesta: una sola vez más, con opciones claras.
+    if ((est.veces || 0) >= 1) {
+        await guardarEstadoProposito(telefono, { veces: (est.veces || 0) + 1 });
+        return `Disculpe, para no confundirnos, ¿qué desea hacer?\n\n• Responda *cambiar* si quiere cambiar el horario de su reunión del ${etiquetaTurno(vigentes[0].inicio)}.\n• Responda *otro tema* si es una consulta distinta.`;
+    }
+    return null;
 }
 
 // --- Contexto que recibe el modelo en cada mensaje ---
@@ -2485,6 +2573,8 @@ async function conversarConHerramientas({ instrucciones, contents, herramientas,
 }
 
 // respuestaAlAsesor: true si este mensaje es la primera respuesta del cliente a un mensaje que le escribió el asesor.
+const REGEX_DICE_AGREGADO = /\b(agregamos|agregaremos|agregu[ée]|sumamos|sumaremos|sum[ée]|qued[óo] (agregad|sumad|incluid)|incluimos|incluiremos)\b[^.?!]{0,80}\b(tema|consulta)/i;
+
 async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = false } = {}) {
     let historial = userHistories.get(remitenteId);
     if (!historial) {
@@ -2523,20 +2613,33 @@ async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = 
     }
     const directa = await eleccionDirecta(remitenteId, mensajeTexto).catch(e => { console.error('Elección directa:', e.message); return null; });
     if (directa) return directa;
+    const porProposito = await propositoDirecto(remitenteId, mensajeTexto).catch(e => { console.error('Propósito directo:', e.message); return null; });
+    if (porProposito) return porProposito;
 
     const instrucciones = construirInstrucciones() + '\n\nCONTEXTO ACTUAL:\n' + await contextoCliente(remitenteId);
     let silencio = false; // una herramienta ya le respondió al cliente: no se agrega texto del modelo
+    let temaAgregado = false;
     const reply = await conversarConHerramientas({
         instrucciones,
         contents: [...base, mensajeUsuario],
         herramientas: HERRAMIENTAS_CLIENTE,
         ejecutar: async (nombre, args) => {
             const r = await ejecutarHerramientaCliente(remitenteId, nombre, args);
+            if (r?.tema_agregado) temaAgregado = true;
             if (r && r._silencio) { silencio = true; const { _silencio, ...resto } = r; return resto; }
             return r;
         }
     });
     if (silencio) return '';
+    if (reply && !temaAgregado && REGEX_DICE_AGREGADO.test(reply)) {
+        // Dice que sumó un tema que nunca se sumó: se corrige con la pregunta que corresponde.
+        const vig = await turnosActivosCliente(remitenteId);
+        if (vig.length) {
+            console.warn('El modelo dijo que agregó un tema sin hacerlo; se corrige.');
+            await guardarEstadoProposito(remitenteId, { estado: 'tema', proposito: 'otro_tema' });
+            return preguntaTema(vig[0], Boolean((await obtenerContacto(remitenteId))?.es_cliente));
+        }
+    }
     return reply ? limpiarTratamiento(reply) : null;
 }
 
@@ -3438,7 +3541,7 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
