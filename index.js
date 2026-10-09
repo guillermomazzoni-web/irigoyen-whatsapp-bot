@@ -549,6 +549,8 @@ const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', '
 const HORARIO_BASE = { 1: [['12:00', '18:00']], 2: [['12:00', '18:00']], 3: [['12:00', '18:00']], 4: [['12:00', '18:00']], 5: [['12:00', '18:00']] };
 const BLOQUE_MIN = { consulta: 45, dudas: 30 };
 const ESPECIALIDADES = ['SAS', 'SRL', 'SA', 'Mantenimiento societario', 'Transferencia', 'Disolución y cierre', 'Asociación Civil / ONG', 'Otra consulta'];
+// Temas legales que no son de sociedades: penal, accidentes y familia no se atienden; el resto lo evalúa el asesor
+// (ver derivar_consulta en la sección 7).
 const PASO_MIN = 45;
 const ANTICIPACION_MIN = 180;       // no se ofrecen turnos con menos de 3 horas
 const DIAS_A_OFRECER = 10;
@@ -1015,7 +1017,7 @@ async function turnosActivosCliente(telefono) {
 // Lo que espera una decisión del administrador: pedidos nuevos y cambios de horario pedidos por clientes.
 async function turnosPendientesAdmin() {
     const { rows } = await db.query(
-        `SELECT * FROM turnos WHERE (estado = 'pendiente_admin' AND inicio > NOW())
+        `SELECT * FROM turnos WHERE (estado = 'pendiente_admin' AND inicio > NOW() AND (cambio IS NULL OR cambio->>'origen' <> 'asesor'))
             OR (estado = 'confirmado' AND cambio->>'origen' = 'cliente' AND inicio > NOW() - INTERVAL '1 hour')
          ORDER BY actualizado_en`);
     return rows;
@@ -1033,9 +1035,15 @@ function descripcionTurno(t) {
     return `#${t.id} · ${t.nombre || 'Sin nombre'} · ${t.producto || 'Consulta'} · ${etiquetaTurno(t.inicio)}${t.tipo === 'dudas' ? ' (dudas de presupuesto)' : ''}${cambio}`;
 }
 
+// Corrige tratamientos repetidos ("Sr. Sr. Mazzo").
+function limpiarTratamiento(texto) {
+    return String(texto || '').replace(/\b(Sr|Sra|Srta)\.?\s+(?:(?:Sr|Sra|Srta)\.?\s+)+/g, '$1. ');
+}
+
 // Mensajes que el sistema manda por su cuenta: quedan guardados en el historial del cliente.
 async function enviarACliente(telefono, texto) {
     if (!socketActual) throw new Error('WhatsApp no está conectado');
+    texto = limpiarTratamiento(texto);
     await socketActual.sendMessage(telefono, { text: texto });
     await guardarMensaje(telefono, 'bot', texto);
     userHistories.delete(telefono); // se recarga desde la base en el próximo mensaje
@@ -1397,6 +1405,53 @@ async function marcarCliente(texto, esCliente = true) {
     return { ok: true, mensaje: `Listo, ${c.nombre || 'el contacto'}${c.numero ? ` (+${c.numero})` : ''} quedó como ${esCliente ? '⭐ cliente' : 'prospecto'}.` };
 }
 
+// El administrador agenda una reunión nueva para un cliente (aparte de las que ya tenga).
+// consultar_cliente: en lugar de confirmarla, se la propone y se confirma sola si acepta.
+async function agendarReunion({ cliente, turno_id, fecha, hora, tema, consultar_cliente }) {
+    let telefono = null, nombre = null, numero = null;
+    if (turno_id) {
+        const t = await obtenerTurno(turno_id);
+        if (t) { telefono = t.telefono; nombre = t.nombre; numero = t.numero; }
+    }
+    if (!telefono && cliente) {
+        const c = await buscarContacto(cliente);
+        if (c.error) return { ok: false, mensaje: c.error };
+        telefono = c.telefono; nombre = c.nombre; numero = c.numero;
+    }
+    if (!telefono) return { ok: false, mensaje: 'Decime para qué cliente es la reunión.' };
+    const f = interpretarFecha(fecha), h = normalizarHora(hora);
+    if (!f || !h) return { ok: false, mensaje: 'Decime el día y la hora de la reunión.' };
+    const inicio = desdeBA(f, h);
+    if (inicio <= new Date()) return { ok: false, mensaje: 'Ese horario ya pasó.' };
+    const fin = new Date(inicio.getTime() + BLOQUE_MIN.consulta * 60000);
+    const libre = await horarioLibre(inicio, fin, []);
+    if (!libre.ok) return { ok: false, mensaje: `El ${etiquetaTurno(inicio)} no está libre: ${libre.mensaje}. Decime otro horario.` };
+    const evaluacion = await leerConfigJSON(`evaluacion:${telefono}`, 30);
+    const motivo = String(tema || '').trim() || (evaluacion ? `${evaluacion.area}: ${evaluacion.resumen}` : 'Reunión agendada por el asesor');
+    const producto = evaluacion?.area ? `Otro tema: ${evaluacion.area}` : (ESPECIALIDADES.includes(tema) ? tema : 'Otra consulta');
+    const { rows: [t] } = await db.query(
+        `INSERT INTO turnos (telefono, nombre, numero, producto, motivo, tipo, inicio, fin, estado, cambio)
+         VALUES ($1, $2, $3, $4, $5, 'consulta', $6, $7, 'pendiente_admin', $8) RETURNING *`,
+        [telefono, nombre, numero, producto, motivo, inicio, fin, consultar_cliente ? nuevoCambio(inicio, fin, 'asesor') : null]);
+    await borrarConfig(`evaluacion:${telefono}`).catch(() => {});
+    if (consultar_cliente) {
+        await enviarACliente(telefono, `El asesor le propone una reunión por Google Meet el ${etiquetaTurno(inicio)} para tratar su consulta${evaluacion ? ` sobre ${evaluacion.area}` : ''}. ¿Le queda bien ese horario?`);
+        return { ok: true, mensaje: `Le propuse a ${nombre || 'el cliente'} una reunión el ${etiquetaTurno(inicio)} (turno #${t.id}). Si acepta, se confirma sola.` };
+    }
+    const r = await crearReunion(t);
+    return r.ok ? { ok: true, mensaje: `Listo, agendé una reunión nueva para ${nombre || 'el cliente'} el ${etiquetaTurno(inicio)} (turno #${t.id}) y le avisé. Meet creado.` } : r;
+}
+
+// El asesor decide no tomar una consulta que no es de sociedades.
+async function rechazarConsulta({ cliente }) {
+    const c = await buscarContacto(cliente);
+    if (c.error) return { ok: false, mensaje: c.error };
+    const evaluacion = await leerConfigJSON(`evaluacion:${c.telefono}`, 30);
+    await borrarConfig(`evaluacion:${c.telefono}`).catch(() => {});
+    await enviarACliente(c.telefono, `Le agradecemos mucho su consulta${evaluacion ? ` sobre ${evaluacion.area}` : ''}. Lamentablemente no es un tema que el Estudio pueda tomar en este momento; le recomendamos consultar con un profesional especializado. Quedamos a su disposición para cualquier consulta de sociedades.`);
+    return { ok: true, mensaje: `Listo, le avisé a ${c.nombre || 'el cliente'} con amabilidad que no tomamos su consulta.` };
+}
+
 // El administrador le escribe a un cliente; su primera respuesta (y lo que mande en los 5 minutos siguientes) se le reenvía.
 async function escribirAlCliente({ turno_id, cliente, mensaje, propuesta_fecha, propuesta_hora }) {
     if (!String(mensaje || '').trim()) return { ok: false, mensaje: 'Falta el texto del mensaje.' };
@@ -1411,12 +1466,33 @@ async function escribirAlCliente({ turno_id, cliente, mensaje, propuesta_fecha, 
         telefono = c.telefono; nombre = c.nombre;
     }
     if (!telefono) return { ok: false, mensaje: 'No sé a qué cliente escribirle. Decime el nombre o el número de turno.' };
+    if (propuesta_hora) {
+        // Antes de ofrecerle un horario, se revisa que esté libre.
+        const t = turno_id ? await obtenerTurno(turno_id) : null;
+        const f = interpretarFecha(propuesta_fecha) || (t && partesBA(t.inicio).fecha);
+        const h = normalizarHora(propuesta_hora);
+        if (!f || !h) return { ok: false, mensaje: 'No entendí el día o la hora que le querés ofrecer.' };
+        const ini = desdeBA(f, h);
+        const dur = t ? new Date(t.fin) - new Date(t.inicio) : (BLOQUE_MIN.consulta * 60000);
+        const libre = await horarioLibre(ini, new Date(ini.getTime() + dur), t ? [t.id] : []);
+        if (!libre.ok) return { ok: false, mensaje: `No le mandé nada: el ${etiquetaTurno(ini)} no está libre (${libre.mensaje}). Decime otro horario.` };
+    }
     await enviarACliente(telefono, String(mensaje).trim());
     await guardarConfig(`esperando_respuesta:${telefono}`, JSON.stringify({
         creada: Date.now(), mensaje: String(mensaje).trim(), turno_id: turno_id || null, respondidoEn: null,
         propuesta: propuesta_hora ? { fecha: propuesta_fecha || null, hora: propuesta_hora } : null
     }));
     return { ok: true, mensaje: `Listo, le escribí a ${nombre || 'el cliente'}. Cuando responda te paso lo que diga.` };
+}
+
+async function leerConfigJSON(clave, dias = 7) {
+    try {
+        const v = JSON.parse(await leerConfig(clave) || 'null');
+        if (!v || Date.now() - v.creada > dias * 24 * 3600000) return null;
+        return v;
+    } catch (e) {
+        return null;
+    }
 }
 
 async function leerEsperandoRespuesta(telefono) {
@@ -1478,7 +1554,10 @@ function construirInstrucciones() {
         '12. HONESTIDAD: nunca digas que enviaste, pediste, reservaste, cancelaste o confirmaste algo si la herramienta no devolvió "ok". Si devolvió un error, explicalo con amabilidad y ofrecé la alternativa que indique la herramienta. Nunca prometas una respuesta del asesor que no se pidió.\n' +
         '13. NO CONTRADIGAS AL SISTEMA: los mensajes de confirmación, cancelación, reprogramación o propuesta que figuran en la conversación son reales. Explicá según el CONTEXTO ACTUAL qué reunión está vigente. Si hay algo que no sabés, decí que lo consultás con el asesor.\n' +
         '14. FECHAS: usá SOLO las fechas de la tabla del CONTEXTO ACTUAL (con su año). Nunca calcules ni inventes una fecha o un año.\n' +
-        '15. Respondé siempre con texto normal para el cliente. Nunca escribas etiquetas, código ni nombres de herramientas.' +
+        '15. Respondé siempre con texto normal para el cliente. Nunca escribas etiquetas, código ni nombres de herramientas.\n' +
+        '16. TEMAS QUE NO SON DE SOCIEDADES: el Estudio también evalúa otros temas legales (por ejemplo sucesiones, contratos, laboral, civil). NO atiende penal, accidentes ni familia (divorcios, alimentos, tenencia, régimen de visitas). ' +
+        'Si la consulta no es de sociedades: hacé como MÁXIMO 3 o 4 preguntas breves, de a una (de qué se trata, si ya hay algo iniciado, para cuándo lo necesita) y después usá derivar_consulta con un resumen. ' +
+        'No ofrezcas horarios para estos temas: los evalúa y agenda el asesor. Las sucesiones NO son "familia": se evalúan.' +
         reglasAdmin;
 }
 
@@ -1533,6 +1612,19 @@ const HERRAMIENTAS_CLIENTE = [
         name: 'responder_asistencia',
         description: 'Respuesta del cliente a la pregunta del sistema sobre su reunión (si va a asistir, si quiere reagendar o si prefiere que lo contactemos más adelante). El sistema le responde solo.',
         parameters: { type: 'OBJECT', properties: { respuesta: { type: 'STRING', enum: ['si', 'no'] } }, required: ['respuesta'] }
+    },
+    {
+        name: 'derivar_consulta',
+        description: 'Para temas legales que NO son de sociedades (por ejemplo sucesiones, contratos, laboral, civil). Si es penal, accidentes o familia, el Estudio no lo atiende. Si no, se le pasa un resumen al asesor para que evalúe si lo toma. Usala después de 3 o 4 preguntas como máximo.',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                area: { type: 'STRING', description: 'Rama del derecho, por ejemplo "sucesiones", "laboral", "contratos", "civil", "penal", "accidentes", "familia".' },
+                resumen: { type: 'STRING', description: 'Resumen claro de lo que necesita el cliente, con los datos que dio (situación, si ya hay algo iniciado, urgencia).' },
+                urgencia: { type: 'STRING', description: 'Para cuándo lo necesita, si lo dijo.' }
+            },
+            required: ['area', 'resumen']
+        }
     },
     {
         name: 'cancelar_mi_turno',
@@ -1647,6 +1739,10 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             let activos = await turnosActivosCliente(telefono);
             const previa = await leerDatosConsulta(telefono);
 
+            const evaluacion = await leerConfigJSON(`evaluacion:${telefono}`, 7);
+            if (evaluacion && !activos.length) {
+                return { error: `Su consulta sobre ${evaluacion.area} está en evaluación por el asesor. NO ofrezcas horarios: decile que el asesor lo va a contactar a la brevedad.` };
+            }
             // Si ya tiene una reunión, primero hay que saber si quiere cambiarla o si es otro tema.
             if (activos.length && !args.proposito) {
                 return { pregunta: `El cliente ya tiene ${activos[0].estado === 'confirmado' ? 'una reunión confirmada' : 'un pedido de reunión'} el ${etiquetaTurno(activos[0].inicio)}. NO ofrezcas horarios todavía: preguntale si desea cambiar ese horario o si se trata de otro tema, y volvé a llamar con "proposito".` };
@@ -1654,8 +1750,11 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             if (activos.length && args.proposito === 'otro_tema' && !esCliente) {
                 // Prospecto: el tema nuevo se suma a la misma reunión.
                 const t = activos[0];
-                const tema = [args.especialidad && args.especialidad !== t.producto ? args.especialidad : null, String(args.motivo || '').trim()].filter(Boolean).join(': ');
-                if (!tema) return { error: 'Preguntale cuál es el otro tema que quiere tratar.' };
+                const detalle = String(args.motivo || '').trim();
+                if (detalle.length < 12 || /^(otra|otro|nueva|una)?\s*(consulta|reunion|reunión|tema)( general| adicional| mas| más| nueva)?\.?$/i.test(detalle) || /reuni[oó]n adicional|otra consulta|otro tema|consulta general/i.test(detalle)) {
+                    return { error: 'Todavía no sabés cuál es el otro tema. NO sumes nada: preguntale con amabilidad de qué se trata concretamente.' };
+                }
+                const tema = [args.especialidad && args.especialidad !== t.producto ? args.especialidad : null, detalle].filter(Boolean).join(': ');
                 await actualizarTurno(t.id, { motivo: `${t.motivo || ''}${t.motivo ? ' | ' : ''}Tema adicional: ${tema}`.slice(0, 1000) });
                 await enviarAAdmin(`📌 ${t.nombre || 'Un cliente'} agregó un tema a su reunión #${t.id} (${etiquetaTurno(t.inicio)}): ${tema}`);
                 return { ok: true, tema_agregado: true, indicacion: `Decile que sumamos ese tema a su reunión del ${etiquetaTurno(t.inicio)}, así el asesor lo ve todo en el mismo encuentro. No ofrezcas otros horarios.` };
@@ -1762,6 +1861,22 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             if (!si && !preguntaAsistenciaAbierta(t)) return { error: 'No hay ninguna pregunta de asistencia pendiente. Si quiere cancelar, usá cancelar_mi_turno.' };
             await procesarRespuestaAsistencia(t, si);
             return { ok: true, _silencio: true };
+        }
+
+        if (nombre === 'derivar_consulta') {
+            const area = normalizarTexto(args.area);
+            const quien = contacto?.nombre && contacto.nombre !== 'No indicado' ? contacto.nombre : 'Un cliente';
+            // Se decide por el área (no por el resumen: "mi familia" puede aparecer en una sucesión).
+            const noAtendida = /penal|delito|imputad|detenid|carcel/.test(area) ? 'penal'
+                : /accident|choque|siniestro/.test(area) ? 'accidentes'
+                : /familia|divorc|alimento|tenencia|cuidado personal|regimen de (visita|comunicacion)|adopci|violencia/.test(area) ? 'familia' : null;
+            if (noAtendida) {
+                await enviarAAdmin(`ℹ️ ${quien}${contacto?.numero ? ` (+${contacto.numero})` : ''} consultó por un tema de ${noAtendida} (no lo atendemos). Se lo dije con amabilidad.\n📝 ${args.resumen}`);
+                return { ok: true, no_atendida: noAtendida, indicacion: `Decile con amabilidad que el Estudio no trabaja temas de ${noAtendida} y que le recomendamos consultar con un profesional especializado. No ofrezcas horarios. Si tiene alguna consulta de sociedades, con gusto lo ayudamos.` };
+            }
+            await guardarConfig(`evaluacion:${telefono}`, JSON.stringify({ area: args.area, resumen: args.resumen, urgencia: args.urgencia || null, creada: Date.now() }));
+            await enviarAAdmin(`⚖️ *Consulta para evaluar* · ${args.area}\n\n👤 ${quien}${contacto?.numero ? ` (+${contacto.numero})` : ''}${esCliente ? ' · ⭐ Cliente' : ''}\n📝 ${args.resumen}${args.urgencia ? `\n⏱️ ${args.urgencia}` : ''}\n\n¿La atendemos? Si sí, decime por ejemplo "agendale una reunión el jueves a las 17:15". Si no, decime "no la atendemos".`);
+            return { ok: true, en_evaluacion: true, indicacion: 'Decile que le pasamos su consulta al asesor para evaluarla y que nos comunicaremos a la brevedad. NO ofrezcas horarios ni prometas que se va a atender.' };
         }
 
         if (nombre === 'cancelar_mi_turno') {
@@ -1947,6 +2062,8 @@ async function contextoCliente(telefono) {
         if (recientes.length) partes.push(`Movimientos recientes: ${recientes.map(r => `reunión/pedido del ${etiquetaTurno(r.inicio)}: ${nombres[r.estado]}`).join('; ')}.`);
         const esperando = await leerEsperandoRespuesta(telefono);
         if (esperando) partes.push(`El asesor le escribió hace poco: «${esperando.mensaje}».`);
+        const evaluacion = await leerConfigJSON(`evaluacion:${telefono}`, 7);
+        if (evaluacion) partes.push(`Su consulta sobre ${evaluacion.area} está en evaluación por el asesor (${evaluacion.resumen}). No ofrezcas horarios para ese tema: el asesor lo contacta.`);
         const ofrecidas = await leerOpcionesOfrecidas(telefono);
         if (ofrecidas) partes.push(`Últimas opciones ofrecidas (si elige una, usá solicitar_turno con ese número en "opcion"):\n${ofrecidas.opciones.map((o, i) => `${i + 1}. ${o.texto}`).join('\n')}`);
     } catch (e) { /* sin contexto de turnos */ }
@@ -2241,7 +2358,7 @@ async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = 
             'Respondé en UNA o DOS oraciones: agradecé (si se queja, pedí disculpas con sinceridad) y decile que ya se lo transmitimos al asesor, que le confirma a la brevedad. ' +
             'NO ofrezcas horarios, NO confirmes ni canceles nada, NO hagas preguntas.';
         const r = await conversarConHerramientas({ instrucciones, contents: [...base, mensajeUsuario], herramientas: [] });
-        return r || 'Muchas gracias por su respuesta. Ya se la transmitimos al asesor, que le confirmará a la brevedad.';
+        return r ? limpiarTratamiento(r) : 'Muchas gracias por su respuesta. Ya se la transmitimos al asesor, que le confirmará a la brevedad.';
     }
 
     const directas = [
@@ -2268,7 +2385,7 @@ async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = 
         }
     });
     if (silencio) return '';
-    return reply || null;
+    return reply ? limpiarTratamiento(reply) : null;
 }
 
 // Detección del nombre del cliente (solo mientras no lo tengamos).
@@ -2507,6 +2624,20 @@ const HERRAMIENTAS_ADMIN = [
             propuesta_hora: { type: 'STRING', description: 'Si el mensaje le propone un nuevo horario para su reunión: HH:MM.' } }, required: ['mensaje'] }
     },
     {
+        name: 'agendar_reunion', description: 'Agenda una reunión NUEVA para un cliente (aparte de las que ya tenga), por ejemplo para otro tema o una consulta evaluada. Revisa que el horario esté libre. Por defecto la confirma, crea el Meet y le avisa al cliente; con consultar_cliente=true se la propone y se confirma si acepta.',
+        parameters: { type: 'OBJECT', properties: {
+            cliente: { type: 'STRING', description: 'Nombre o teléfono del cliente.' },
+            turno_id: { type: 'INTEGER', description: 'O el número de una reunión que ya tiene ese cliente (para identificarlo).' },
+            fecha: { type: 'STRING', description: 'AAAA-MM-DD' },
+            hora: { type: 'STRING', description: 'HH:MM — solo una hora que haya dicho el administrador o el cliente.' },
+            tema: { type: 'STRING', description: 'Tema de la reunión.' },
+            consultar_cliente: { type: 'BOOLEAN', description: 'true para proponérsela en lugar de confirmarla.' } }, required: ['fecha', 'hora'] }
+    },
+    {
+        name: 'no_atender_consulta', description: 'El Estudio decide no tomar una consulta que no es de sociedades: le avisa al cliente con amabilidad.',
+        parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono del cliente.' } }, required: ['cliente'] }
+    },
+    {
         name: 'marcar_cliente', description: 'Marca a una persona como CLIENTE del Estudio (ya contrató alguna vez) o la vuelve a prospecto.',
         parameters: { type: 'OBJECT', properties: {
             texto: { type: 'STRING', description: 'Nombre, apellido o número de teléfono.' },
@@ -2538,7 +2669,9 @@ const HERRAMIENTAS_ADMIN = [
     }
 ];
 
-const HERRAMIENTAS_SENSIBLES = new Set(['confirmar', 'rechazar', 'proponer_horario', 'mover_reunion', 'descartar_cambio', 'cancelar_turno', 'cambiar_duracion', 'escribir_al_cliente', 'borrar_regla']);
+const HERRAMIENTAS_SENSIBLES = new Set(['confirmar', 'rechazar', 'proponer_horario', 'mover_reunion', 'descartar_cambio', 'cancelar_turno', 'cambiar_duracion', 'escribir_al_cliente', 'borrar_regla', 'agendar_reunion', 'no_atender_consulta']);
+// Herramientas con una hora: la hora tiene que haberla dicho el administrador o el cliente.
+const CON_HORA = { proponer_horario: 'hora', mover_reunion: 'hora', agendar_reunion: 'hora', escribir_al_cliente: 'propuesta_hora', cambiar_duracion: 'hasta' };
 const CON_TURNO = new Set(['confirmar', 'rechazar', 'proponer_horario', 'mover_reunion', 'descartar_cambio', 'cancelar_turno', 'cambiar_duracion']);
 const VIGENCIA_ACCION_MIN = 30;
 let historialAdmin = [];
@@ -2574,6 +2707,11 @@ async function describirAccion(nombre, args) {
             else if (turno && args.minutos_extra) fin = partesBA(new Date(new Date(turno.fin).getTime() + args.minutos_extra * 60000)).hora;
             return `cambiar la reunión ${t} para que termine a las ${fin || '?'} hs (actualizo Google Calendar)`;
         }
+        case 'agendar_reunion': {
+            const f = interpretarFecha(args.fecha), h = normalizarHora(args.hora);
+            return `${args.consultar_cliente ? 'proponerle' : 'agendarle'} a ${turno?.nombre || args.cliente || 'el cliente'} una reunión NUEVA el ${f && h ? etiquetaTurno(desdeBA(f, h)) : '(horario sin definir)'}${args.tema ? ` (${args.tema})` : ''}${args.consultar_cliente ? '' : ', crear el Meet y avisarle'}`;
+        }
+        case 'no_atender_consulta': return `avisarle a ${args.cliente} que el Estudio no toma su consulta`;
         case 'escribir_al_cliente': return `enviarle a ${turno?.nombre || args.cliente || 'el cliente'} este mensaje por WhatsApp:\n\n«${args.mensaje || ''}»\n\nSi responde, te paso su respuesta`;
         case 'borrar_regla': return `borrar la regla ${args.numero}: "${globalAdminRules[args.numero - 1]?.regla || '(no existe)'}"`;
         default: return nombre;
@@ -2601,6 +2739,8 @@ async function ejecutarAccionAdmin(nombre, args) {
         case 'cambiar_duracion': return cambiarDuracion(args.turno_id, args);
         case 'escribir_al_cliente': return escribirAlCliente(args);
         case 'marcar_cliente': return marcarCliente(args.texto, args.es_cliente !== false);
+        case 'agendar_reunion': return agendarReunion(args);
+        case 'no_atender_consulta': return rechazarConsulta(args);
         case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
         case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
         case 'restablecer_dia': return restablecerDia(args.fecha);
@@ -2645,6 +2785,9 @@ async function instruccionesAdmin() {
         '- Si el cliente pidió un cambio, "confirmar" lo aplica y "rechazar" lo descarta avisándole que se mantiene su horario.\n' +
         '- Para cambiar el horario de una reunión: si el cliente ya aceptó (respondió que sí, o el administrador dice que ya lo habló), usá mover_reunion con cliente_acepto=true; si todavía no lo sabe, usá proponer_horario o escribir_al_cliente. Nunca canceles una reunión para cambiarla de horario.\n' +
         '- Si el cliente mantiene su horario y hay un cambio que ya no hace falta, usá descartar_cambio (no le avisa nada).\n' +
+        'Para una reunión NUEVA de un cliente (otro tema, o una consulta "⚖️ para evaluar" que decidiste atender) usá agendar_reunion: NUNCA muevas su reunión actual para eso. Si decidís no atender una consulta, usá no_atender_consulta.\n' +
+        'HORAS: usá solo una hora que haya dicho el administrador o el cliente (por ejemplo "a las 17:15"). Si dicen "después de la otra reunión" o algo sin hora, preguntá a qué hora, indicando a qué hora termina la reunión actual. Nunca elijas una hora por tu cuenta.\n' +
+        'En los mensajes para clientes usá el mismo trato que el bot: "Estimado/a Sr./Sra. Apellido", de usted, en nombre del Estudio.\n' +
         'Para alargar o acortar una reunión usá cambiar_duracion. Para avisarle o preguntarle algo a un cliente usá escribir_al_cliente, redactando en tono formal (si le proponés un horario, completá propuesta_fecha y propuesta_hora).\n' +
         'Si una herramienta responde "requiere_confirmacion", preguntale al administrador si confirma, repitiendo la descripción tal cual, y terminá con "¿Confirmo?". No la des por hecha.\n' +
         'Necesitás el número de turno para actuar: sacalo de ver_agenda o buscar_turnos. NUNCA inventes ni adivines un número; si hay más de uno posible, preguntá cuál. Los eventos que dicen "no es un turno del bot" no se manejan desde acá.\n' +
@@ -2700,6 +2843,8 @@ async function procesarMensajeAdmin(sock, sender, text) {
     // Un "sí" a una pregunta del asistente ("¿se lo propongo a las 16:30?") ejecuta directo, sin repreguntar.
     const ultima = historialAdmin.length ? historialAdmin[historialAdmin.length - 1] : null;
     const yaConfirmo = esAfirmativo(text) && ultima?.role === 'model' && /\?\s*$/.test(ultima.parts?.[0]?.text || '');
+    // Lo que se dijo en los últimos mensajes (del administrador y respuestas de clientes): de ahí salen las horas válidas.
+    const textosRecientes = [...historialAdmin.slice(-8).map(x => x.parts?.[0]?.text || '').filter(t => !/^(Listo|Entendí|Le propuse|Así quedó|Acá tenés)/.test(t)), text];
     const respuesta = await conversarConHerramientas({
         instrucciones: await instruccionesAdmin(),
         contents: [...historialAdmin, mensajeUsuario],
@@ -2714,6 +2859,10 @@ async function procesarMensajeAdmin(sock, sender, text) {
                     if (!t || !ESTADOS_VIGENTES.includes(t.estado) || new Date(t.fin) <= new Date()) {
                         return { ok: false, error: `El turno #${args.turno_id} ${t ? `no está vigente (${t.estado})` : 'no existe'}. No le pidas confirmación al administrador: buscá el correcto con buscar_turnos o ver_agenda, o preguntale cuál es.` };
                     }
+                }
+                const campoHora = CON_HORA[nombre];
+                if (campoHora && args[campoHora] && !horaMencionada(textosRecientes, normalizarHora(args[campoHora]))) {
+                    return { ok: false, error: `Nadie dijo las ${normalizarHora(args[campoHora])}. No inventes horarios: preguntale al administrador a qué hora (si hace falta, decile a qué hora termina la reunión actual).` };
                 }
                 const avisarCliente = nombre === 'mover_reunion' && !args.cliente_acepto;
                 if (HERRAMIENTAS_SENSIBLES.has(nombre) && (!yaConfirmo || avisarCliente)) {
