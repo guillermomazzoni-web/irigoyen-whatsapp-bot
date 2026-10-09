@@ -1094,6 +1094,95 @@ async function resumenAgenda(dias = 7) {
     return lineas.join('\n\n');
 }
 
+function nuevoFinTurno(t, { hasta, minutos_extra } = {}) {
+    if (hasta && normalizarHora(hasta)) return desdeBA(partesBA(t.inicio).fecha, normalizarHora(hasta));
+    if (minutos_extra) return new Date(new Date(t.fin).getTime() + Number(minutos_extra) * 60000);
+    return null;
+}
+
+// Alarga o acorta una reunión confirmada (en Google Calendar y en la base).
+async function cambiarDuracion(id, args) {
+    const t = await obtenerTurno(id);
+    if (!t || t.estado !== 'confirmado') return { ok: false, mensaje: `El turno #${id} no es una reunión confirmada.` };
+    const fin = nuevoFinTurno(t, args);
+    if (!fin) return { ok: false, mensaje: 'Decime hasta qué hora o cuántos minutos le sumo.' };
+    const inicio = new Date(t.inicio);
+    if (fin <= new Date(inicio.getTime() + 15 * 60000)) return { ok: false, mensaje: 'La reunión tiene que durar al menos 15 minutos.' };
+    const finViejo = new Date(t.fin);
+    if (fin > finViejo) {
+        let google = await ocupadoGoogle(finViejo, fin);
+        if (google === null) return { ok: false, mensaje: 'No pude leer la agenda de Google.' };
+        google = await sinEventoPropio(google, t.id);
+        const otros = await ocupadoTurnos(finViejo, fin, t.id);
+        if (google.length || otros.length) {
+            return { ok: false, mensaje: `No puedo alargarla hasta las ${partesBA(fin).hora}: ${await describirChoque(google, finViejo, fin, [t.id])}.` };
+        }
+    }
+    if (t.evento_id) {
+        const r = await apiCalendar('PATCH', `/calendars/primary/events/${encodeURIComponent(t.evento_id)}?sendUpdates=none`,
+            { end: { dateTime: fin.toISOString(), timeZone: ZONA_HORARIA } });
+        if (r.status !== 200) return { ok: false, mensaje: `Google Calendar no aceptó el cambio (${r.status}).` };
+    }
+    await actualizarTurno(t.id, { fin });
+    // Los bloqueos que quedaron dentro de la reunión (por ejemplo, uno puesto para "reservar" el tiempo extra) ya no hacen falta.
+    const fecha = partesBA(inicio).fecha;
+    const quitados = [];
+    for (const e of (await cargarExcepciones(fecha, fecha)).filter(x => x.tipo === 'bloquear' && x.desde && x.hasta)) {
+        if (minutos(e.desde) >= minutos(partesBA(inicio).hora) && minutos(e.hasta) <= minutos(partesBA(fin).hora)) {
+            await db.query('DELETE FROM excepciones_horario WHERE id = $1', [e.id]);
+            quitados.push(`${e.desde} a ${e.hasta}`);
+        }
+    }
+    return { ok: true, mensaje: `Listo, la reunión #${t.id} de ${t.nombre || 'el cliente'} (${etiquetaTurno(inicio)}) ahora termina a las ${partesBA(fin).hora} hs. Ya está actualizada en Google Calendar.` +
+        (quitados.length ? ` Saqué el bloqueo de ${quitados.join(', ')} porque ya queda dentro de la reunión.` : '') +
+        ' Si querés avisarle al cliente, decime y le escribo.' };
+}
+
+// El administrador le escribe a un cliente; sus respuestas de las próximas 24 hs se le reenvían.
+async function escribirAlCliente({ turno_id, cliente, mensaje }) {
+    if (!String(mensaje || '').trim()) return { ok: false, mensaje: 'Falta el texto del mensaje.' };
+    let telefono = null, nombre = null;
+    if (turno_id) {
+        const t = await obtenerTurno(turno_id);
+        if (t) { telefono = t.telefono; nombre = t.nombre; }
+    }
+    if (!telefono && cliente) {
+        const encontrado = await buscarContacto(cliente);
+        if (encontrado.error) return { ok: false, mensaje: encontrado.error };
+        telefono = encontrado.telefono; nombre = encontrado.nombre;
+    }
+    if (!telefono) return { ok: false, mensaje: 'No sé a qué cliente escribirle. Decime el nombre o el número de turno.' };
+    await enviarACliente(telefono, String(mensaje).trim());
+    await guardarConfig(`esperando_respuesta:${telefono}`, JSON.stringify({ creada: Date.now(), mensaje: String(mensaje).trim() }));
+    return { ok: true, mensaje: `Listo, le escribí a ${nombre || 'el cliente'}. Cuando responda te paso lo que diga.` };
+}
+
+async function leerEsperandoRespuesta(telefono) {
+    try {
+        const v = JSON.parse(await leerConfig(`esperando_respuesta:${telefono}`) || 'null');
+        if (!v || Date.now() - v.creada > 24 * 3600000) return null;
+        return v;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function buscarContacto(texto) {
+    const digitos = soloDigitos(texto || '');
+    let rows;
+    if (digitos.length >= 8) {
+        ({ rows } = await db.query(`SELECT telefono, nombre, numero FROM contactos WHERE numero LIKE $1`, ['%' + digitos.slice(-10)]));
+    } else {
+        const palabras = normalizarTexto(texto || '').split(' ').filter(p => p.length > 2);
+        if (!palabras.length) return { error: 'Decime el nombre o el número de la persona.' };
+        ({ rows } = await db.query(`SELECT telefono, nombre, numero FROM contactos WHERE nombre IS NOT NULL`));
+        rows = rows.filter(r => { const n = normalizarTexto(r.nombre); return palabras.every(w => n.includes(w)); });
+    }
+    if (!rows.length) return { error: `No encontré a nadie con "${texto}" entre los contactos.` };
+    if (rows.length > 1) return { error: `Encontré varias personas: ${rows.map(r => `${r.nombre || 'Sin nombre'}${r.numero ? ` (+${r.numero})` : ''}`).join(', ')}. ¿Cuál es?` };
+    return rows[0];
+}
+
 async function marcarCliente(texto, esCliente = true) {
     const digitos = soloDigitos(texto || '');
     let rows;
@@ -1674,6 +1763,8 @@ async function contextoCliente(telefono) {
             for (const o of otros) partes.push(`Además tiene un pedido de cambio de horario al ${etiquetaTurno(o.inicio)}, ${estados[o.estado]}.`);
             if (t.estado === 'propuesto') partes.push('Si acepta el horario propuesto usá responder_propuesta; si pide otro día u hora, usá solicitar_turno con ese día y hora (NO canceles).');
         }
+        const esperando = await leerEsperandoRespuesta(telefono);
+        if (esperando) partes.push(`El asesor le escribió hace poco: «${esperando.mensaje}». Si el cliente responde a eso, agradecele y decile que ya se lo transmitimos al asesor; no tomes decisiones ni confirmes nada por tu cuenta.`);
         const ofrecidas = await leerOpcionesOfrecidas(telefono);
         if (ofrecidas) {
             partes.push(`Opciones de horario ofrecidas a este cliente (si elige una, usá solicitar_turno con ese número en "opcion"):\n` +
@@ -2130,6 +2221,20 @@ const HERRAMIENTAS_ADMIN = [
             es_cliente: { type: 'BOOLEAN', description: 'true = cliente; false = prospecto.' } }, required: ['texto'] }
     },
     {
+        name: 'cambiar_duracion', description: 'Alarga o acorta una reunión ya confirmada: cambia la hora de fin en Google Calendar y en la agenda del bot. Usala para "agregale 30 minutos" o "que termine a las 13:45".',
+        parameters: { type: 'OBJECT', properties: {
+            turno_id: { type: 'INTEGER' },
+            hasta: { type: 'STRING', description: 'Nueva hora de fin, HH:MM.' },
+            minutos_extra: { type: 'INTEGER', description: 'Minutos a sumar (o restar, en negativo) a la hora de fin actual. Usá esto o "hasta".' } }, required: ['turno_id'] }
+    },
+    {
+        name: 'escribir_al_cliente', description: 'Le manda un mensaje de WhatsApp a un cliente de parte del Estudio (por ejemplo, avisarle un cambio o hacerle una pregunta). Si responde, su respuesta le llega al administrador.',
+        parameters: { type: 'OBJECT', properties: {
+            turno_id: { type: 'INTEGER', description: 'Turno del cliente, si se trata de una reunión.' },
+            cliente: { type: 'STRING', description: 'Nombre o teléfono del cliente, si no hay turno.' },
+            mensaje: { type: 'STRING', description: 'Texto final para el cliente: formal, de "usted", en nombre del Estudio, claro y breve. No copies literal la orden del administrador.' } }, required: ['mensaje'] }
+    },
+    {
         name: 'ver_disponibilidad', description: 'Franjas de atención de cada día (horario normal y cambios cargados).',
         parameters: { type: 'OBJECT', properties: { dias: { type: 'INTEGER', description: 'Cantidad de días (por defecto 7).' } } }
     },
@@ -2188,7 +2293,7 @@ const HERRAMIENTAS_ADMIN = [
     }
 ];
 
-const HERRAMIENTAS_SENSIBLES = new Set(['confirmar_turno', 'rechazar_turno', 'proponer_horario', 'cancelar_turno', 'borrar_regla']);
+const HERRAMIENTAS_SENSIBLES = new Set(['confirmar_turno', 'rechazar_turno', 'proponer_horario', 'cancelar_turno', 'borrar_regla', 'cambiar_duracion', 'escribir_al_cliente']);
 const VIGENCIA_ACCION_MIN = 30;
 let historialAdmin = [];
 let ultimoMensajeAdmin = 0;
@@ -2219,6 +2324,14 @@ async function describirAccion(nombre, args) {
         case 'rechazar_turno': return `rechazar el turno ${t} y ofrecerle otros horarios al cliente`;
         case 'proponer_horario': return `proponerle a ${turno?.nombre || 'el cliente'} el ${etiquetaTurno(desdeBA(args.fecha, normalizarHora(args.hora) || '00:00'))} en lugar de su pedido`;
         case 'cancelar_turno': return `cancelar el turno ${t}, borrarlo del calendario y avisarle al cliente`;
+        case 'cambiar_duracion': {
+            const fin = turno ? nuevoFinTurno(turno, args) : null;
+            return `cambiar la reunión ${t} para que termine a las ${fin ? partesBA(fin).hora : (args.hasta || '?')} hs (actualizo Google Calendar)`;
+        }
+        case 'escribir_al_cliente': {
+            const destino = turno ? (turno.nombre || 'el cliente') : (args.cliente || 'el cliente');
+            return `enviarle a ${destino} este mensaje por WhatsApp:\n\n«${args.mensaje || ''}»\n\nSi responde, te paso su respuesta`;
+        }
         case 'borrar_regla': return `borrar la regla ${args.numero}: "${globalAdminRules[args.numero - 1]?.regla || '(no existe)'}"`;
         default: return nombre;
     }
@@ -2235,6 +2348,8 @@ async function ejecutarAccionAdmin(nombre, args) {
                 : { encontrados: [], indicacion: 'No hay turnos vigentes con esos datos. Decíselo y pedile el nombre del cliente o el día y la hora.' };
         }
         case 'marcar_cliente': return marcarCliente(args.texto, args.es_cliente !== false);
+        case 'cambiar_duracion': return cambiarDuracion(args.turno_id, args);
+        case 'escribir_al_cliente': return escribirAlCliente(args);
         case 'ver_disponibilidad': return { texto: await resumenDisponibilidad(Math.min(Math.max(args.dias || 7, 1), 30)) };
         case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
         case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
@@ -2287,7 +2402,9 @@ function calendarioReferencia() {
 async function instruccionesAdmin() {
     const pendientes = await turnosPendientesAdmin().catch(() => []);
     return 'Sos el asistente personal del administrador del Estudio Jurídico Jaime Irigoyen, por WhatsApp. ' +
-        'Hablás en español rioplatense, de "vos", con tono cercano, claro y breve (2 a 5 líneas salvo que muestres una lista).\n' +
+        'Hablás en español rioplatense, de "vos", con tono cercano pero prolijo, claro y breve (2 a 5 líneas salvo que muestres una lista). Nunca uses "che" ni muletillas o expresiones informales.\n' +
+        'HONESTIDAD: nunca digas que hiciste, enviaste, avisaste, cambiaste o cancelaste algo si una herramienta no lo hizo y devolvió "ok". Si no tenés una herramienta para lo que te pide, decíselo con claridad y ofrecé lo que sí podés hacer. Nunca inventes respuestas de clientes.\n' +
+        'Para alargar o acortar una reunión usá cambiar_duracion (NO la canceles ni bloquees horarios para eso). Para avisarle o preguntarle algo a un cliente usá escribir_al_cliente, redactando el mensaje en tono formal.\n' +
         'Para cualquier dato o acción usá las herramientas: nunca inventes reuniones, horarios ni estados.\n' +
         'Horario normal de atención: lunes a viernes de 12 a 18 hs. Turnos de 30 min + 15 de margen.\n' +
         'Si una herramienta responde "requiere_confirmacion", preguntale al administrador si confirma, repitiendo la descripción tal cual, y terminá con "¿Confirmo?". No la des por hecha.\n' +
@@ -2355,7 +2472,7 @@ async function procesarMensajeAdmin(sock, sender, text) {
         alAgotar: 'No logré encontrar lo que me pedís. ¿Me decís el nombre del cliente o el día y la hora de la reunión? También podés escribir "ADMIN AGENDA" para ver la lista con los números de turno.',
         ejecutar: async (nombre, args) => {
             try {
-                if (args.turno_id != null && ['confirmar_turno', 'rechazar_turno', 'proponer_horario', 'cancelar_turno'].includes(nombre)) {
+                if (args.turno_id != null && ['confirmar_turno', 'rechazar_turno', 'proponer_horario', 'cancelar_turno', 'cambiar_duracion', 'escribir_al_cliente'].includes(nombre)) {
                     const t = await obtenerTurno(args.turno_id);
                     if (!t || !ESTADOS_OCUPAN.includes(t.estado) || new Date(t.fin) <= new Date()) {
                         return { ok: false, error: `El turno #${args.turno_id} ${t ? `no está vigente (${t.estado})` : 'no existe'}. No le pidas confirmación al administrador: buscá el correcto con buscar_turnos o ver_agenda, o preguntale cuál es.` };
@@ -2377,6 +2494,19 @@ async function procesarMensajeAdmin(sock, sender, text) {
     const texto = respuesta || 'Perdón, no pude procesar eso ahora (Gemini no respondió). Probá de nuevo en un minuto o usá un comando, por ejemplo "ADMIN AGENDA".';
     await sock.sendMessage(sender, { text: texto });
     if (respuesta) recordarEnHistorialAdmin(text, respuesta);
+}
+
+// Si el administrador le escribió a este cliente en las últimas 24 hs, se le reenvía lo que conteste.
+async function reenviarRespuestaAlAdmin(telefono, texto) {
+    try {
+        if (!(await leerEsperandoRespuesta(telefono))) return false;
+        const contacto = await obtenerContacto(telefono);
+        await enviarAAdmin(`💬 ${contacto?.nombre && contacto.nombre !== 'No indicado' ? contacto.nombre : 'El cliente'}${contacto?.numero ? ` (+${contacto.numero})` : ''} respondió:\n\n«${texto}»`);
+        return true;
+    } catch (e) {
+        console.error('Reenvío al admin:', e.message);
+        return false;
+    }
 }
 
 // ---------- Tareas programadas: avisos, vencimientos y recordatorios ----------
@@ -2751,6 +2881,7 @@ async function connectToWhatsApp() {
 
                 registrarMensajeCliente(sender, text);
                 await guardarMensaje(sender, 'cliente', text, numero);
+                await reenviarRespuestaAlAdmin(sender, text);
 
                 // Buscar el nombre solo mientras el contacto no lo tenga guardado.
                 const contacto = await obtenerContacto(sender);
@@ -2802,7 +2933,7 @@ module.exports = {
     partesBA, desdeBA, franjasDelDia, elegirOpciones, horariosLibres, esAfirmativo, esNegativo, etiquetaTurno,
     ejecutarHerramientaCliente, procesarMensajeAdmin, revisarTareas, conversarConHerramientas, confirmarTurno,
     inicializarDB, guardarConfig, consultarGemini, db, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
-    resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados, rechazarTurno, proponerHorario, interpretarFecha, construirInstrucciones, textoRecordatorioCliente, esAfirmativoCliente, esNegativoCliente,
+    resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados, reenviarRespuestaAlAdmin, instruccionesAdmin, rechazarTurno, proponerHorario, interpretarFecha, construirInstrucciones, textoRecordatorioCliente, esAfirmativoCliente, esNegativoCliente,
     _historialAdmin: () => historialAdmin,
     _set: (k, v) => { if (k === 'socket') socketActual = v; if (k === 'conectado') isConnected = v; if (k === 'dbOk') dbOk = v; }
 };
