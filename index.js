@@ -186,6 +186,7 @@ async function inicializarDB() {
         await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS flujo TEXT`);
         await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS reemplaza_id INTEGER`);
         await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS interes TEXT`);
+        await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS es_cliente BOOLEAN DEFAULT FALSE`);
         dbOk = true;
         console.log('✅ Base de datos inicializada correctamente.');
     } catch (e) {
@@ -226,7 +227,7 @@ async function actualizarContacto(telefono, campo, valor) {
 
 async function obtenerContacto(telefono) {
     try {
-        const { rows } = await db.query('SELECT nombre, email, numero FROM contactos WHERE telefono = $1', [telefono]);
+        const { rows } = await db.query('SELECT nombre, email, numero, es_cliente FROM contactos WHERE telefono = $1', [telefono]);
         return rows[0] || null;
     } catch (e) {
         return null;
@@ -876,7 +877,7 @@ async function enviarAAdmin(texto) {
 function textoAvisoTurno(t, segundo = false) {
     const cambio = t.cambio_de ? `🔄 *Cambio de horario* (antes: ${t.cambio_de})\n` : '';
     return `${segundo ? '🔔 *Segundo aviso* — sigue pendiente\n\n' : ''}📅 *Pedido de turno #${t.id}*\n${cambio}\n` +
-        `👤 ${t.nombre || 'Sin nombre'}${t.numero ? ` (+${t.numero})` : ''}${t.email ? ` · ✉️ ${t.email}` : ''}\n` +
+        `👤 ${t.nombre || 'Sin nombre'}${t.numero ? ` (+${t.numero})` : ''}${t.es_cliente ? ' · ⭐ Cliente' : ''}${t.email ? ` · ✉️ ${t.email}` : ''}\n` +
         `📂 Especialidad: ${t.producto || 'Sin definir'}\n` +
         `📝 Motivo: ${t.motivo || 'sin detalle'}\n` +
         (t.interes ? `${{ alto: '🔥', medio: '🙂', bajo: '🤔' }[t.interes] || '•'} Interés: ${t.interes}\n` : '') +
@@ -895,7 +896,7 @@ async function crearPedidoTurno({ telefono, inicio, tipo, producto, motivo, inte
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pendiente_admin', NOW(), $9, $10) RETURNING *`,
         [telefono, contacto?.nombre || null, contacto?.numero || null, producto || null, motivo || null, tipo, inicio, fin, reemplazaId, interes]);
     const t = rows[0];
-    await enviarAAdmin(textoAvisoTurno({ ...t, cambio_de: cambioDe, email: contacto?.email || null }));
+    await enviarAAdmin(textoAvisoTurno({ ...t, cambio_de: cambioDe, email: contacto?.email || null, es_cliente: contacto?.es_cliente }));
     return t;
 }
 
@@ -1093,6 +1094,23 @@ async function resumenAgenda(dias = 7) {
     return lineas.join('\n\n');
 }
 
+async function marcarCliente(texto, esCliente = true) {
+    const digitos = soloDigitos(texto || '');
+    let rows;
+    if (digitos.length >= 8) {
+        ({ rows } = await db.query(`SELECT telefono, nombre, numero FROM contactos WHERE numero LIKE $1`, ['%' + digitos.slice(-10)]));
+    } else {
+        const palabras = normalizarTexto(texto || '').split(' ').filter(p => p.length > 2);
+        if (!palabras.length) return { ok: false, mensaje: 'Decime el nombre o el número de la persona.' };
+        ({ rows } = await db.query(`SELECT telefono, nombre, numero FROM contactos WHERE nombre IS NOT NULL`));
+        rows = rows.filter(r => { const n = normalizarTexto(r.nombre); return palabras.every(w => n.includes(w)); });
+    }
+    if (!rows.length) return { ok: false, mensaje: `No encontré a nadie con "${texto}" entre los contactos.` };
+    if (rows.length > 1) return { ok: false, mensaje: `Encontré varias personas: ${rows.map(r => `${r.nombre || 'Sin nombre'}${r.numero ? ` (+${r.numero})` : ''}`).join(', ')}. ¿Cuál es?` };
+    await db.query('UPDATE contactos SET es_cliente = $1 WHERE telefono = $2', [esCliente, rows[0].telefono]);
+    return { ok: true, mensaje: `Listo, ${rows[0].nombre || 'el contacto'}${rows[0].numero ? ` (+${rows[0].numero})` : ''} quedó como ${esCliente ? '⭐ cliente' : 'prospecto'}.` };
+}
+
 // Busca turnos vigentes por nombre del cliente, fecha u hora (para que el asistente encuentre el número).
 async function buscarTurnos({ texto, fecha, hora } = {}) {
     const { rows } = await db.query(`SELECT * FROM turnos WHERE estado = ANY($1) AND fin > NOW() ORDER BY inicio`, [ESTADOS_OCUPAN]);
@@ -1156,7 +1174,9 @@ function construirInstrucciones() {
         '- Destacá los BENEFICIOS del Estudio cuando vengan al caso (no todos juntos): presentación de la documentación en un máximo de 48 horas hábiles, Formulario 185 y alta en ARCA incluidos, todo el trámite online con reuniones por Google Meet, primera reunión sin cargo, y acompañamiento después de la constitución (mantenimiento, asambleas, cambios de autoridades). Si tiene apuro, resaltá la rapidez; si duda entre tipos de sociedad, decile que el asesor lo ayuda a elegir la mejor opción para su proyecto.\n' +
         '- Llevá la conversación hacia la reunión sin cargo como el paso natural para avanzar ("En la reunión el asesor le explica todo y le arma la propuesta a medida").\n' +
         '- Si dice que no, que lo va a pensar o que todavía no, respetalo: dejá la puerta abierta con amabilidad, ofrecé enviarle información por correo (pedí el correo) y no insistas más de una vez.\n' +
-        '9. REUNIONES: solo cuando ya sepas el nombre, QUÉ NECESITA y algún dato clave, ofrecé una reunión sin cargo de 30 minutos por Google Meet con un asesor del Estudio. Si te pide una reunión de entrada, primero preguntale con amabilidad para qué es, así lo atiende el asesor indicado. ' +
+        '- Interés del cliente: "alto" si tiene apuro o fecha o ya decidió; "medio" si está averiguando; "bajo" si solo pregunta o duda; si no está claro, "medio".\n' +
+        '- Si el cliente YA tiene una reunión y pide otra, preguntale si quiere cambiar ese horario o si es otro tema, y pasá la respuesta en "proposito" de consultar_horarios.\n' +
+        '9. REUNIONES: solo cuando ya sepas el nombre, QUÉ NECESITA y, si es una constitución, al menos dos datos (cuántos socios, a qué se va a dedicar, para cuándo lo necesita), ofrecé una reunión sin cargo de 30 minutos por Google Meet con un asesor del Estudio. Si te pide una reunión de entrada, primero preguntale con amabilidad para qué es, así lo atiende el asesor indicado. ' +
         'Para ofrecer horarios usá SIEMPRE la herramienta consultar_horarios con "especialidad" y "motivo" (y "interes"): nunca inventes días ni horas. Presentá las opciones numeradas y pedí que responda solo con el número (1, 2 o 3). ' +
         'Cuando el cliente elija una opción de la lista, usá solicitar_turno con ese número en "opcion". ' +
         'Si el cliente pide un día y hora concretos (por ejemplo "¿puede ser el miércoles a las 16:30?"), usá directamente solicitar_turno con "fecha" y "hora"; si no está libre, la herramienta te devuelve las opciones más cercanas para ofrecer. ' +
@@ -1180,7 +1200,11 @@ const HERRAMIENTAS_CLIENTE = [
                 tipo: { type: 'STRING', enum: ['consulta', 'dudas'], description: '"consulta" (30 min) o "dudas" sobre un presupuesto ya enviado (15 min, con prioridad).' },
                 especialidad: { type: 'STRING', enum: ['SAS', 'SRL', 'SA', 'Mantenimiento societario', 'Transferencia', 'Disolución y cierre', 'Asociación Civil / ONG', 'Otra consulta'], description: 'Tema de la reunión, para asignar al asesor indicado.' },
                 motivo: { type: 'STRING', description: 'Resumen de lo que necesita el cliente con los datos que dio (socios, actividad, urgencia, etc.).' },
-                interes: { type: 'STRING', enum: ['alto', 'medio', 'bajo'], description: 'Qué tan interesado/decidido parece el cliente.' },
+                interes: { type: 'STRING', enum: ['alto', 'medio', 'bajo'], description: 'Interés según lo que dijo el cliente: "alto" si tiene apuro o una fecha, o ya decidió hacerlo; "medio" si está averiguando; "bajo" si solo pregunta o duda. Si no está claro, "medio".' },
+                socios: { type: 'INTEGER', description: 'Cantidad de socios, si el cliente lo dijo.' },
+                actividad: { type: 'STRING', description: 'A qué se va a dedicar la empresa, si el cliente lo dijo.' },
+                plazo: { type: 'STRING', description: 'Para cuándo lo necesita, si el cliente lo dijo.' },
+                proposito: { type: 'STRING', enum: ['cambio', 'otro_tema'], description: 'Solo si el cliente YA tiene una reunión: "cambio" si quiere cambiar ese horario, "otro_tema" si es una consulta distinta.' },
                 fecha: { type: 'STRING', description: 'Día que pidió el cliente, AAAA-MM-DD (usá la fecha actual del contexto para calcularlo). Omitir si no pidió un día.' },
                 hora: { type: 'STRING', description: 'Hora que pidió el cliente, HH:MM en 24 hs (ej. "16:30"). Omitir si no pidió una hora.' }
             },
@@ -1199,7 +1223,7 @@ const HERRAMIENTAS_CLIENTE = [
                 tipo: { type: 'STRING', enum: ['consulta', 'dudas'] },
                 producto: { type: 'STRING', enum: ['SAS', 'SRL', 'SA', 'Mantenimiento societario', 'Transferencia', 'Disolución y cierre', 'Asociación Civil / ONG', 'Otra consulta'], description: 'Especialidad o tema principal de la consulta.' },
                 motivo: { type: 'STRING', description: 'Resumen de lo que necesita el cliente con los datos que dio (socios, actividad, urgencia).' },
-                interes: { type: 'STRING', enum: ['alto', 'medio', 'bajo'], description: 'Qué tan interesado/decidido parece el cliente.' }
+                interes: { type: 'STRING', enum: ['alto', 'medio', 'bajo'], description: 'Interés según lo que dijo el cliente: "alto" si tiene apuro o una fecha, o ya decidió hacerlo; "medio" si está averiguando; "bajo" si solo pregunta o duda. Si no está claro, "medio".' }
             },
             required: ['tipo']
         }
@@ -1236,6 +1260,27 @@ const HERRAMIENTAS_CLIENTE = [
 
 // Últimas opciones ofrecidas a cada cliente, para que pueda elegir por número sin depender de que el modelo
 // reconstruya la fecha (las opciones se muestran sin año).
+// Qué falta saber antes de ofrecer horarios. Devuelve una indicación para el modelo, o null si ya alcanza.
+const ESPECIALIDADES_CONSTITUCION = ['SAS', 'SRL', 'SA', 'Asociación Civil / ONG'];
+function faltanDatos(d, esCliente = false) {
+    if (!d.especialidad || String(d.motivo || '').trim().length < 8) {
+        return 'Todavía no sabés para qué es la reunión. NO ofrezcas horarios: preguntale con amabilidad qué necesita (por ejemplo, constituir una SAS, SRL o SA, mantenimiento, transferencia, cierre o una Asociación Civil), para que lo atienda el asesor indicado.';
+    }
+    if (d.completo || esCliente || !ESPECIALIDADES_CONSTITUCION.includes(d.especialidad)) return null;
+    if (!d.socios) { const m = String(d.motivo).match(/(\d+)\s*soci/i); if (m) d.socios = Number(m[1]); }
+    const faltan = [!d.socios && 'cuántos socios van a ser', !d.actividad && 'a qué se va a dedicar', !d.plazo && 'para cuándo lo necesita'].filter(Boolean);
+    if (faltan.length >= 2) {
+        return `Todavía faltan datos clave. NO ofrezcas horarios: hacele UNA sola pregunta, sobre ${faltan[0]}. Antes podés comentarle brevemente un beneficio del Estudio. Cuando responda, volvé a llamar a consultar_horarios con ese dato (socios, actividad o plazo).`;
+    }
+    return null;
+}
+
+function motivoCompleto(d) {
+    const extra = [d.socios && `Socios: ${d.socios}`, d.actividad && `Actividad: ${d.actividad}`, d.plazo && `Plazo: ${d.plazo}`]
+        .filter(x => x && !String(d.motivo || '').toLowerCase().includes(String(x.split(': ')[1]).toLowerCase()));
+    return [String(d.motivo || '').trim(), ...extra].filter(Boolean).join(' · ') || null;
+}
+
 // Para qué es la reunión (se guarda al ofrecer horarios y se usa al pedir el turno).
 // Si un turno se cae (cancelado, rechazado, vencido), se recuerda para qué era, para ofrecer otro sin volver a preguntar.
 async function recordarConsultaDeTurno(t) {
@@ -1243,7 +1288,8 @@ async function recordarConsultaDeTurno(t) {
     await guardarDatosConsulta(t.telefono, {
         especialidad: ESPECIALIDADES.includes(t.producto) ? t.producto : 'Otra consulta',
         motivo: t.motivo || `Reprogramación de la reunión del ${etiquetaTurno(t.inicio)}`,
-        interes: t.interes || null
+        interes: t.interes || null,
+        completo: true // ya se indagó cuando se pidió el turno original
     });
 }
 
@@ -1330,15 +1376,41 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
     try {
         if (nombre === 'consultar_horarios') {
             const tipo = args.tipo === 'dudas' ? 'dudas' : 'consulta';
-            const activos = await turnosActivosCliente(telefono);
-            // Antes de ofrecer horarios hay que saber para qué es la reunión (salvo que sea un cambio de un turno existente).
+            let activos = await turnosActivosCliente(telefono);
+            const contacto = await obtenerContacto(telefono);
+            const esCliente = Boolean(contacto?.es_cliente);
             const previa = await leerDatosConsulta(telefono);
-            const motivo = String(args.motivo || '').trim() || previa?.motivo || activos[0]?.motivo || '';
-            const especialidad = ESPECIALIDADES.includes(args.especialidad) ? args.especialidad : (previa?.especialidad || activos[0]?.producto || null);
-            if (!activos.length && (motivo.length < 12 || !especialidad)) {
-                return { error: 'Todavía no sabés para qué es la reunión. NO ofrezcas horarios: preguntale con amabilidad qué necesita (por ejemplo, constituir una SAS, SRL o SA, mantenimiento, transferencia, cierre o una Asociación Civil) y algún dato clave, para que lo atienda el asesor indicado.' };
+
+            // Si ya tiene una reunión, primero hay que saber si quiere cambiarla o si es otro tema.
+            if (activos.length && !args.proposito) {
+                return { pregunta: `El cliente ya tiene ${activos[0].estado === 'confirmado' ? 'una reunión confirmada' : 'un pedido de reunión'} el ${etiquetaTurno(activos[0].inicio)}. NO ofrezcas horarios todavía: preguntale si desea cambiar ese horario o si se trata de otro tema. Con su respuesta, volvé a llamar a consultar_horarios con "proposito".` };
             }
-            await guardarDatosConsulta(telefono, { especialidad, motivo, interes: args.interes || previa?.interes || null });
+            if (activos.length && args.proposito === 'otro_tema' && !esCliente) {
+                // Prospecto: el tema nuevo se suma a la misma reunión.
+                const t = activos[0];
+                const tema = [args.especialidad && args.especialidad !== t.producto ? args.especialidad : null, String(args.motivo || '').trim()].filter(Boolean).join(': ');
+                if (!tema) return { error: 'Preguntale cuál es el otro tema que quiere tratar.' };
+                await actualizarTurno(t.id, { motivo: `${t.motivo || ''}${t.motivo ? ' | ' : ''}Tema adicional: ${tema}`.slice(0, 1000) });
+                await enviarAAdmin(`📌 ${t.nombre || 'Un cliente'} agregó un tema a su reunión #${t.id} (${etiquetaTurno(t.inicio)}): ${tema}`);
+                return { ok: true, tema_agregado: true, indicacion: `Decile que sumamos ese tema a su reunión del ${etiquetaTurno(t.inicio)}, así el asesor lo ve todo en la misma reunión. No ofrezcas otros horarios.` };
+            }
+            const separada = activos.length > 0 && args.proposito === 'otro_tema' && esCliente;
+            const esCambio = activos.length > 0 && !separada;
+            if (separada) activos = []; // cliente: reunión aparte, sin tocar la que ya tiene
+
+            const motivo = String(args.motivo || '').trim() || previa?.motivo || (esCambio ? activos[0]?.motivo : '') || '';
+            const especialidad = ESPECIALIDADES.includes(args.especialidad) ? args.especialidad : (previa?.especialidad || (esCambio ? activos[0]?.producto : null) || null);
+            const datos = {
+                especialidad, motivo, interes: args.interes || previa?.interes || null,
+                socios: args.socios || previa?.socios || null, actividad: args.actividad || previa?.actividad || null, plazo: args.plazo || previa?.plazo || null,
+                proposito: separada ? 'separada' : (esCambio ? 'cambio' : 'nueva'),
+                completo: Boolean(previa?.completo && !args.motivo)
+            };
+            await guardarDatosConsulta(telefono, datos); // se guarda aunque falten datos, para ir sumándolos
+            if (!esCambio) {
+                const falta = faltanDatos(datos, esCliente);
+                if (falta) return { error: falta };
+            }
             const vigente = activos.find(t => t.estado === 'confirmado') || null;
             const fecha = args.fecha ? interpretarFecha(args.fecha) : null;
             const hora = args.hora ? normalizarHora(args.hora) : null;
@@ -1359,15 +1431,19 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             if (!opciones.length) return { error: 'No hay horarios libres en los próximos días. Decile que un asesor lo contactará para coordinar.' };
             await guardarOpcionesOfrecidas(telefono, opciones, tipo);
             const r = { opciones: listaOpciones(opciones), indicacion: 'Mostralas numeradas con el mismo número. Cuando el cliente elija, llamá a solicitar_turno con ese número en "opcion".' };
+            if (separada) r.nota_cliente = 'Es cliente del Estudio: esta será una reunión aparte de la que ya tiene.';
             if (nota) r.nota = nota;
-            if (activos.length) r.cambio = `El cliente ya tiene un turno el ${etiquetaTurno(activos[0].inicio)}. Si elige una opción, solicitar_turno lo envía como pedido de cambio de horario${vigente ? ' (su reunión actual se mantiene hasta que el asesor confirme la nueva)' : ''}.`;
+            if (esCambio) r.cambio = `El cliente ya tiene un turno el ${etiquetaTurno(activos[0].inicio)}. Si elige una opción, solicitar_turno lo envía como pedido de cambio de horario${vigente ? ' (su reunión actual se mantiene hasta que el asesor confirme la nueva)' : ''}.`;
             return r;
         }
 
         if (nombre === 'solicitar_turno') {
             const ofrecidas = await leerOpcionesOfrecidas(telefono);
             const tipo = args.tipo === 'dudas' ? 'dudas' : (ofrecidas?.tipo || 'consulta');
-            const activos = await turnosActivosCliente(telefono);
+            const datosPrevios = await leerDatosConsulta(telefono);
+            const contactoS = await obtenerContacto(telefono);
+            const separadaS = Boolean(contactoS?.es_cliente) && (args.proposito === 'otro_tema' || datosPrevios?.proposito === 'separada');
+            const activos = separadaS ? [] : await turnosActivosCliente(telefono);
             const vigente = activos.find(t => t.estado === 'confirmado') || null;
             const enTramite = activos.filter(t => t.estado !== 'confirmado');
             const libres = await horariosLibres({ tipo, excluirId: activos.map(t => t.id), paso: 15 });
@@ -1390,10 +1466,12 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             const anterior = enTramite[0] || vigente;
             const datos = await leerDatosConsulta(telefono);
             const producto = ESPECIALIDADES.includes(args.producto) ? args.producto : (datos?.especialidad || anterior?.producto || null);
-            const motivoPedido = String(args.motivo || '').trim() || datos?.motivo || anterior?.motivo || null;
-            if (!anterior && (!producto || !motivoPedido)) {
-                return { error: 'Todavía no sabés para qué es la reunión. NO se envió ningún pedido: primero preguntale qué necesita.' };
+            const baseDatos = { ...(datos || {}), especialidad: producto, motivo: String(args.motivo || '').trim() || datos?.motivo || anterior?.motivo || '' };
+            if (!anterior) {
+                const falta = faltanDatos(baseDatos, Boolean(contactoS?.es_cliente));
+                if (falta) return { error: `NO se envió ningún pedido. ${falta}` };
             }
+            const motivoPedido = anterior && !datos ? (anterior.motivo || null) : motivoCompleto(baseDatos);
             for (const t of enTramite) await actualizarTurno(t.id, { estado: t.estado === 'propuesto' ? 'rechazado_cliente' : 'reemplazado' });
             const t = await crearPedidoTurno({
                 telefono, inicio, tipo,
@@ -1402,6 +1480,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
                 cambioDe: anterior ? `${etiquetaTurno(anterior.inicio)}${anterior.estado === 'confirmado' ? ', confirmada' : anterior.estado === 'propuesto' ? ', propuesto por vos' : ', pendiente'}` : null
             });
             await borrarConfig(`opciones:${telefono}`).catch(() => {});
+            await borrarConfig(`consulta:${telefono}`).catch(() => {});
             return {
                 ok: true, estado: 'pedido enviado al asesor, pendiente de confirmación', horario: etiquetaTurno(t.inicio),
                 mantiene: vigente ? etiquetaTurno(vigente.inicio) : null,
@@ -1545,8 +1624,8 @@ async function procesarRespuestaAsistencia(t, asiste) {
 async function asistenciaDirecta(telefono, texto) {
     const si = esAfirmativoCliente(texto), no = !si && esNegativoCliente(texto);
     if (!si && !no) return false;
-    const t = await turnoActivoCliente(telefono);
-    if (!preguntaAsistenciaAbierta(t)) return false;
+    const t = (await turnosActivosCliente(telefono)).find(preguntaAsistenciaAbierta);
+    if (!t) return false;
     await procesarRespuestaAsistencia(t, si);
     return true;
 }
@@ -1574,6 +1653,10 @@ async function eleccionDirecta(telefono, texto) {
 async function contextoCliente(telefono) {
     const partes = [`Fecha y hora actual en Buenos Aires: ${etiquetaTurno(new Date())}.`];
     try {
+        const contacto = await obtenerContacto(telefono);
+        partes.push(contacto?.es_cliente
+            ? 'Esta persona YA ES CLIENTE del Estudio (contrató antes): tratala como cliente, sin la indagación comercial completa; preguntá directo qué necesita. Si ya tiene una reunión y quiere tratar otro tema, puede agendar una reunión aparte.'
+            : 'Esta persona es un PROSPECTO (todavía no contrató): aplicá el perfil comercial. Si ya tiene una reunión y quiere tratar otro tema, se suma a esa misma reunión.');
         const t = await turnoActivoCliente(telefono);
         if (t) {
             const estados = { pendiente_admin: 'pendiente de confirmación del asesor', propuesto: 'propuesto por el asesor, esperando respuesta del cliente', confirmado: 'confirmado' };
@@ -2041,6 +2124,12 @@ const HERRAMIENTAS_ADMIN = [
             hora: { type: 'STRING', description: 'HH:MM, opcional.' } } }
     },
     {
+        name: 'marcar_cliente', description: 'Marca a una persona como CLIENTE del Estudio (ya contrató alguna vez) o la vuelve a prospecto. Buscala por nombre o número de teléfono.',
+        parameters: { type: 'OBJECT', properties: {
+            texto: { type: 'STRING', description: 'Nombre, apellido o número de teléfono.' },
+            es_cliente: { type: 'BOOLEAN', description: 'true = cliente; false = prospecto.' } }, required: ['texto'] }
+    },
+    {
         name: 'ver_disponibilidad', description: 'Franjas de atención de cada día (horario normal y cambios cargados).',
         parameters: { type: 'OBJECT', properties: { dias: { type: 'INTEGER', description: 'Cantidad de días (por defecto 7).' } } }
     },
@@ -2145,6 +2234,7 @@ async function ejecutarAccionAdmin(nombre, args) {
                 ? { encontrados: encontrados.map(t => `${descripcionTurno(t)} · ${t.estado}`), indicacion: encontrados.length > 1 ? 'Hay más de uno: preguntale al administrador cuál.' : 'Usá este número.' }
                 : { encontrados: [], indicacion: 'No hay turnos vigentes con esos datos. Decíselo y pedile el nombre del cliente o el día y la hora.' };
         }
+        case 'marcar_cliente': return marcarCliente(args.texto, args.es_cliente !== false);
         case 'ver_disponibilidad': return { texto: await resumenDisponibilidad(Math.min(Math.max(args.dias || 7, 1), 30)) };
         case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
         case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
