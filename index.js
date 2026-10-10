@@ -15,6 +15,7 @@
  *  10. Avisos al administrador
  *  11. Asistente del administrador
  *  12. Tareas programadas (recordatorios y vencimientos)
+ *  12b. HubSpot (contactos y negocios; si falla, el bot sigue igual)
  *  13. Comandos de respaldo (ADMIN ESTADO, ADMIN AGENDA, ...)
  *  14. WhatsApp y arranque
  *
@@ -28,6 +29,7 @@
  *   PANEL_PASSWORD          (opcional)    Si se configura, la página del QR pide ?clave=... en la URL.
  *   PORT                    (opcional)    Puerto del servidor web (por defecto 3000).
  *   GOOGLE_CLIENT_ID        (opcional)    Credencial OAuth de Google Cloud, para usar Google Calendar.
+ *   HUBSPOT_TOKEN           (opcional)    Clave de servicio de HubSpot (pat-...). Sin ella, los negocios se guardan igual y se envían cuando se cargue.
  *   GOOGLE_CLIENT_SECRET    (opcional)    Secreto OAuth de Google Cloud.
  *   GOOGLE_CUENTA           (opcional)    Única cuenta de Google que se acepta conectar (por defecto estudiojaimeirigoyen@gmail.com).
  *   PUBLIC_URL              (opcional)    URL pública del bot (por defecto https://irigoyen-whatsapp-bot-production.up.railway.app).
@@ -204,6 +206,29 @@ async function inicializarDB() {
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS es_cliente BOOLEAN DEFAULT FALSE`);
         // Cambio de horario en trámite dentro de la misma reunión: { inicio, fin, origen: 'cliente' | 'asesor', creado }.
         await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS cambio JSONB`);
+        // Negocios (una consulta = un negocio) que se envían a HubSpot.
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS negocios (
+                id SERIAL PRIMARY KEY,
+                telefono TEXT NOT NULL,
+                titulo TEXT,
+                especialidad TEXT,
+                motivo TEXT,
+                interes TEXT,
+                etapa TEXT NOT NULL DEFAULT 'Consulta',
+                cerrado BOOLEAN DEFAULT FALSE,
+                historial TEXT,
+                hubspot_id TEXT,
+                sincronizado BOOLEAN DEFAULT FALSE,
+                error TEXT,
+                creado_en TIMESTAMPTZ DEFAULT NOW(),
+                actualizado_en TIMESTAMPTZ DEFAULT NOW()
+            );
+        `);
+        await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS negocio_id INTEGER`);
+        await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS resultado TEXT`);
+        await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_id TEXT`);
+        await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_sincronizado BOOLEAN DEFAULT FALSE`);
         await migrarTurnosV12();
         dbOk = true;
         console.log('✅ Base de datos inicializada correctamente.');
@@ -1100,13 +1125,14 @@ function textoAgendaYLink(t) {
 
 // --- Pedidos del cliente ---
 
-async function crearPedido({ telefono, inicio, tipo, producto, motivo, interes }) {
+async function crearPedido({ telefono, inicio, tipo, producto, motivo, interes, separada = false }) {
     const contacto = await obtenerContacto(telefono);
     const fin = new Date(inicio.getTime() + (BLOQUE_MIN[tipo] || 45) * 60000);
     const { rows } = await db.query(
         `INSERT INTO turnos (telefono, nombre, numero, producto, motivo, tipo, inicio, fin, estado, avisado_admin_en, interes)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pendiente_admin', NOW(), $9) RETURNING *`,
         [telefono, contacto?.nombre || null, contacto?.numero || null, producto || null, motivo || null, tipo, inicio, fin, interes || null]);
+    await hsPedido(rows[0], { separada });
     await avisarPedidoAlAdmin(rows[0]);
     return rows[0];
 }
@@ -1159,6 +1185,7 @@ async function crearReunion(t, { aviso = '' } = {}) {
     const token = t.token || require('crypto').randomBytes(16).toString('hex');
     await actualizarTurno(t.id, { estado: 'confirmado', evento_id: evento.id, meet: evento.meet, token, cambio: null });
     const nuevo = await obtenerTurno(t.id);
+    await hsConfirmada(nuevo);
     await enviarACliente(t.telefono,
         `${aviso}Su reunión quedó confirmada para el ${etiquetaTurno(t.inicio)} (${TIPO_DURACION_TXT[t.tipo] || '30 minutos'}), por Google Meet, con un asesor del Estudio.\n\n` +
         textoAgendaYLink(nuevo) + (AVISO_GRABACION ? `\n\n${AVISO_GRABACION}` : ''));
@@ -1187,6 +1214,7 @@ async function aplicarCambio(t, { inicio = null, clienteAcepto = false } = {}) {
     const antes = etiquetaTurno(t.inicio);
     await actualizarTurno(t.id, { inicio: nuevoInicio, fin, cambio: null, recordatorios: '{}', flujo: null, negativas: 0 });
     const nuevo = await obtenerTurno(t.id);
+    await hsNota(nuevo, `Reunión #${t.id} reprogramada: del ${antes} al ${etiquetaTurno(nuevoInicio)}`);
     const acepto = clienteAcepto || c?.origen === 'cliente';
     await enviarACliente(t.telefono,
         (acepto
@@ -1213,6 +1241,7 @@ async function rechazarTurno(id) {
     if (t.estado !== 'pendiente_admin') return { ok: false, mensaje: `El turno #${id} está ${t.estado}.` };
     await actualizarTurno(t.id, { estado: 'rechazado', cambio: null });
     await recordarConsultaDeTurno(t);
+    await hsSinReunion(t, 'Sin disponibilidad del asesor; se le ofrecieron otros horarios');
     const libres = await horariosLibres({ tipo: t.tipo });
     const opciones = libres ? elegirOpciones(libres, t.tipo).filter(o => o.inicio.getTime() !== new Date(t.inicio).getTime()) : [];
     if (opciones.length) await guardarOpcionesOfrecidas(t.telefono, opciones, t.tipo);
@@ -1268,6 +1297,7 @@ async function descartarCambio(id) {
     }
     if (t.estado === 'pendiente_admin') {
         await actualizarTurno(t.id, { estado: 'descartado' });
+        await hsSinReunion(t, 'Pedido descartado por el asesor');
         return { ok: true, mensaje: `Listo, descarté el pedido #${t.id} (${etiquetaTurno(t.inicio)}) sin avisarle al cliente.` };
     }
     return { ok: false, mensaje: `El turno #${id} no tiene nada pendiente para descartar.` };
@@ -1283,6 +1313,7 @@ async function cancelarTurno(id, { porCliente = false, silencioso = false } = {}
     }
     await actualizarTurno(t.id, { estado: porCliente ? 'cancelado_cliente' : 'cancelado', cambio: null });
     await recordarConsultaDeTurno(t);
+    await hsSinReunion(t, porCliente ? 'El cliente canceló la reunión' : 'Reunión cancelada');
     if (!silencioso) {
         if (porCliente) await enviarAAdmin(`❌ ${t.nombre || 'Un cliente'} canceló su ${t.estado === 'confirmado' ? 'reunión' : 'pedido'} del ${etiquetaTurno(t.inicio)} (#${t.id}).`);
         else await enviarACliente(t.telefono, `Le informamos que la reunión del ${etiquetaTurno(t.inicio)} fue cancelada. Si lo desea, coordinamos un nuevo horario.`);
@@ -1419,6 +1450,7 @@ async function marcarCliente(texto, esCliente = true) {
     const c = await buscarContacto(texto);
     if (c.error) return { ok: false, mensaje: c.error };
     await db.query('UPDATE contactos SET es_cliente = $1 WHERE telefono = $2', [esCliente, c.telefono]);
+    await hsContactoCambio(c.telefono);
     return { ok: true, mensaje: `Listo, ${c.nombre || 'el contacto'}${c.numero ? ` (+${c.numero})` : ''} quedó como ${esCliente ? '⭐ cliente' : 'prospecto'}.` };
 }
 
@@ -1436,13 +1468,14 @@ async function reiniciarContacto({ cliente }) {
     }
     const { rowCount: reuniones } = await db.query('DELETE FROM turnos WHERE telefono = $1', [tel]);
     await db.query('DELETE FROM mensajes WHERE telefono = $1', [tel]);
+    await db.query('DELETE FROM negocios WHERE telefono = $1', [tel]);
     await db.query(`DELETE FROM configuracion WHERE right(clave, length($1) + 1) = ':' || $1`, [tel]);
     await db.query('DELETE FROM contactos WHERE telefono = $1', [tel]);
     userHistories.delete(tel);
     mensajesCliente.delete(tel);
     avisosFalla.delete(tel);
     for (const k of [...contactosAvisados]) if (String(k).includes(tel)) contactosAvisados.delete(k);
-    return { ok: true, mensaje: `Listo, ${etiquetaContacto(c)} quedó como contacto nuevo: borré ${reuniones} reunión(es)${vigentes.some(t => t.evento_id) ? ' (y sus eventos en Google Calendar)' : ''}, la conversación y su ficha. La próxima vez que escriba, el bot lo trata como si fuera la primera vez.` };
+    return { ok: true, mensaje: `Listo, ${etiquetaContacto(c)} quedó como contacto nuevo: borré ${reuniones} reunión(es)${vigentes.some(t => t.evento_id) ? ' (y sus eventos en Google Calendar)' : ''}, la conversación y su ficha. La próxima vez que escriba, el bot lo trata como si fuera la primera vez.${HUBSPOT_TOKEN ? ' En HubSpot no se borra nada: si querés, borrá ese contacto y sus negocios a mano allá.' : ''}` };
 }
 
 // El administrador agenda una reunión nueva para un cliente (aparte de las que ya tenga).
@@ -1474,6 +1507,7 @@ async function agendarReunion({ cliente, turno_id, fecha, hora, tema, consultar_
          VALUES ($1, $2, $3, $4, $5, 'consulta', $6, $7, 'pendiente_admin', $8) RETURNING *`,
         [telefono, nombre, numero, producto, motivo, inicio, fin, consultar_cliente ? nuevoCambio(inicio, fin, 'asesor') : null]);
     await borrarConfig(`evaluacion:${telefono}`).catch(() => {});
+    await hsPedido(t, { separada: true });
     if (consultar_cliente) {
         await enviarACliente(telefono, `El asesor le propone una reunión por Google Meet el ${etiquetaTurno(inicio)} para tratar su consulta${evaluacion ? ` sobre ${evaluacion.area}` : ''}. ¿Le queda bien ese horario?`);
         return { ok: true, mensaje: `Le propuse a ${nombre || 'el cliente'} una reunión el ${etiquetaTurno(inicio)} (turno #${t.id}). Si acepta, se confirma sola.` };
@@ -1526,6 +1560,10 @@ async function rechazarConsulta({ cliente, telefono }) {
     if (c.error) return { ok: false, mensaje: c.error };
     const evaluacion = await leerConfigJSON(`evaluacion:${c.telefono}`, 30);
     await borrarConfig(`evaluacion:${c.telefono}`).catch(() => {});
+    try {
+        const g = (await negociosAbiertos(c.telefono)).find(x => String(x.titulo || '').startsWith('Otro tema'));
+        if (g) await actualizarNegocio(g.id, { etapa: 'Perdido' }, 'El Estudio no toma la consulta');
+    } catch (e) { console.error('HubSpot (no atendida):', e.message); }
     await enviarACliente(c.telefono, `Le agradecemos mucho su consulta${evaluacion ? ` sobre ${evaluacion.area}` : ''}. Lamentablemente no es un tema que el Estudio pueda tomar en este momento; le recomendamos consultar con un profesional especializado. Quedamos a su disposición para cualquier consulta de sociedades.`);
     return { ok: true, mensaje: `Listo, le avisé a ${etiquetaContacto(c, 'el cliente')} con amabilidad que no tomamos su consulta.` };
 }
@@ -1826,6 +1864,7 @@ async function sumarTemaAReunion(t, { especialidad, motivo }) {
     await borrarConfig(`proposito:${t.telefono}`).catch(() => {});
     const tema = [especialidad && especialidad !== t.producto ? especialidad : null, detalle].filter(Boolean).join(': ');
     await actualizarTurno(t.id, { motivo: `${t.motivo || ''}${t.motivo ? ' | ' : ''}Tema adicional: ${tema}`.slice(0, 1000) });
+    await hsNota(t, `📌 Tema adicional para la reunión del ${etiquetaTurno(t.inicio)}: ${tema}`);
     const c = await obtenerContacto(t.telefono);
     await enviarAAdmin(`📌 ${etiquetaContacto(c || t)} agregó un tema a su reunión #${t.id} (${etiquetaTurno(t.inicio)}): ${tema}`, { anotar: true });
     return { ok: true, tema_agregado: true, indicacion: `Decile que sumamos ese tema a su reunión del ${etiquetaTurno(t.inicio)}, así el asesor lo ve todo en el mismo encuentro. Su horario NO cambia. No ofrezcas otros horarios.` };
@@ -1925,6 +1964,11 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
                 completo: Boolean(previa?.completo && !args.motivo)
             };
             await guardarDatosConsulta(telefono, datos); // se guarda aunque falten datos, para ir sumándolos
+            if (!esCambio && !separada && datos.especialidad && datos.motivo) {
+                try {
+                    if (!(await negociosAbiertos(telefono)).length) await abrirNegocio(telefono, { especialidad: datos.especialidad, motivo: datos.motivo, interes: datos.interes });
+                } catch (e) { console.error('HubSpot (consulta):', e.message); }
+            }
             if (!esCambio) {
                 const falta = faltanDatos(datos, esCliente);
                 if (falta) return { error: falta };
@@ -2016,7 +2060,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             const base = { ...(datos || {}), especialidad: ESPECIALIDADES.includes(args.producto) ? args.producto : (datos?.especialidad || (separada ? 'Otra consulta' : null)), motivo: String(args.motivo || '').trim() || datos?.motivo || '' };
             const falta = faltanDatos(base, esCliente);
             if (falta) return { error: `NO se envió ningún pedido. ${falta}` };
-            const t = await crearPedido({ telefono, inicio, tipo, producto: base.especialidad, motivo: motivoCompleto(base), interes: args.interes || datos?.interes || null });
+            const t = await crearPedido({ telefono, inicio, tipo, producto: base.especialidad, motivo: motivoCompleto(base), interes: args.interes || datos?.interes || null, separada });
             await borrarConfig(`consulta:${telefono}`).catch(() => {});
             await borrarConfig(`proposito:${telefono}`).catch(() => {});
             if (separada) {
@@ -2062,6 +2106,7 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
                 return { ok: true, no_atendida: noAtendida, indicacion: `Decile con amabilidad que el Estudio no trabaja temas de ${noAtendida} y que le recomendamos consultar con un profesional especializado. No ofrezcas horarios. Si tiene alguna consulta de sociedades, con gusto lo ayudamos.` };
             }
             await guardarConfig(`evaluacion:${telefono}`, JSON.stringify({ area: args.area, resumen: args.resumen, urgencia: args.urgencia || null, creada: Date.now() }));
+            await abrirNegocio(telefono, { especialidad: `Otro tema: ${args.area}`, motivo: args.resumen, nuevo: true, nota: '⚖️ En evaluación por el asesor' }).catch(e => console.error('HubSpot (evaluación):', e.message));
             await enviarAAdmin(`⚖️ *Consulta para evaluar* · ${args.area}\n\n👤 ${quien}${esCliente ? ' · ⭐ Cliente' : ''}\n📝 ${args.resumen}${args.urgencia ? `\n⏱️ ${args.urgencia}` : ''}\n\n¿La atendemos? Respondé *sí* y le ofrezco horarios, o decime un día y hora para agendarla. Si no, decime *no*.`, { anotar: true });
             return { ok: true, en_evaluacion: true, indicacion: 'Decile que le pasamos su consulta al asesor para evaluarla y que nos comunicaremos a la brevedad. NO ofrezcas horarios ni prometas que se va a atender.' };
         }
@@ -2897,6 +2942,14 @@ const HERRAMIENTAS_ADMIN = [
         parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono del cliente.' } }, required: ['cliente'] }
     },
     {
+        name: 'resultado_negocio', description: 'Registra cómo siguió una persona (se refleja en HubSpot): si asistió o no a la reunión, si se le envió la propuesta, si contrató (ganado: también la marca como cliente) o si no siguió (perdido).',
+        parameters: { type: 'OBJECT', properties: {
+            cliente: { type: 'STRING', description: 'Nombre o teléfono de la persona.' },
+            turno_id: { type: 'INTEGER', description: 'Número de la reunión, si se sabe.' },
+            resultado: { type: 'STRING', enum: ['asistio', 'no_asistio', 'propuesta_enviada', 'ganado', 'perdido'] },
+            nota: { type: 'STRING', description: 'Detalle breve que haya dado el administrador (opcional).' } }, required: ['resultado'] }
+    },
+    {
         name: 'reiniciar_contacto', description: 'SOLO PARA PRUEBAS: borra todo lo que el bot sabe de UNA persona (reuniones y sus eventos en Google Calendar, conversación, ficha) para que la trate como un contacto nuevo. No le avisa nada a la persona. Nunca para "todos".',
         parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono de la persona.' } }, required: ['cliente'] }
     },
@@ -3015,6 +3068,7 @@ async function ejecutarAccionAdmin(nombre, args) {
         case 'no_atender_consulta': return rechazarConsulta(args);
         case 'atender_consulta': return aceptarConsulta(args);
         case 'reiniciar_contacto': return reiniciarContacto(args);
+        case 'resultado_negocio': return registrarResultado(args);
         case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
         case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
         case 'restablecer_dia': return restablecerDia(args.fecha);
@@ -3052,6 +3106,7 @@ async function leerAccionPendiente() {
 async function instruccionesAdmin() {
     const pendientes = await turnosPendientesAdmin().catch(() => []);
     const consultas = await consultasEnEvaluacion().catch(() => []);
+    const sinResultado = await reunionesSinResultado().catch(() => []);
     return 'Sos el asistente personal del administrador del Estudio Jurídico Jaime Irigoyen, por WhatsApp. ' +
         'Hablás en español rioplatense, de "vos", con tono cercano pero prolijo, claro y breve (2 a 5 líneas salvo que muestres una lista). Nunca uses "che" ni muletillas o expresiones informales.\n' +
         'HONESTIDAD: nunca digas que hiciste, enviaste, avisaste, cambiaste o cancelaste algo si una herramienta no lo hizo y devolvió "ok". Si no tenés una herramienta para lo que te pide, decíselo y ofrecé lo que sí podés hacer. Nunca inventes respuestas de clientes ni afirmes si algo está en Google Calendar sin mirar ver_agenda.\n' +
@@ -3062,6 +3117,7 @@ async function instruccionesAdmin() {
         '- Si el cliente mantiene su horario y hay un cambio que ya no hace falta, usá descartar_cambio (no le avisa nada).\n' +
         'Para una reunión NUEVA de un cliente (otro tema, o una consulta "⚖️ para evaluar" con día y hora) usá agendar_reunion: NUNCA muevas su reunión actual para eso. ' +
         'Para aceptar una consulta "⚖️ para evaluar" sin día ni hora ("decile que sí") usá atender_consulta; para no tomarla, no_atender_consulta. Identificá al cliente por el nombre o el teléfono que figura en el aviso: nunca lo confundas con otro cliente de la conversación.\n' +
+        'SEGUIMIENTO (HubSpot): cuando te diga cómo siguió una persona usá resultado_negocio: "asistió" / "no vino" → asistio / no_asistio; "le mandé la propuesta" → propuesta_enviada; "contrató", "cerramos", "pagó" → ganado (además lo marca como cliente); "no siguió", "no le interesa", "lo perdimos" → perdido. Si la reunión tiene número, pasalo en turno_id.\n' +
         'Si te pide reiniciar, resetear o borrar a una persona para probar ("que el bot crea que es nuevo"), usá reiniciar_contacto con ESA persona. Nunca reinicies a varias juntas ni a alguien que no nombró.\n' +
         'HORAS: usá solo una hora que haya dicho el administrador o el cliente (por ejemplo "a las 17:15"). Si dicen "después de la otra reunión" o algo sin hora, preguntá a qué hora, indicando a qué hora termina la reunión actual. Nunca elijas una hora por tu cuenta.\n' +
         'En los mensajes para clientes usá el mismo trato que el bot: "Estimado/a Sr./Sra. Apellido", de usted, en nombre del Estudio.\n' +
@@ -3073,7 +3129,8 @@ async function instruccionesAdmin() {
         'Horario normal de atención: lunes a viernes de 12 a 18 hs. Turnos de 30 min + 15 de margen. Cada pedido trae especialidad, motivo e interés del cliente.\n\n' +
         `Hoy es ${fechaHoyCompleta()}. Tabla de fechas:\n${calendarioReferencia()}\n\n` +
         (pendientes.length ? `Esperando tu decisión:\n${pendientes.map(descripcionTurno).join('\n')}` : 'No hay pedidos esperando tu decisión.') +
-        (consultas.length ? `\nConsultas para evaluar:\n${consultas.map(c => `• ${etiquetaContacto(c.contacto)}: ${c.area} — ${c.resumen}`).join('\n')}` : '');
+        (consultas.length ? `\nConsultas para evaluar:\n${consultas.map(c => `• ${etiquetaContacto(c.contacto)}: ${c.area} — ${c.resumen}`).join('\n')}` : '') +
+        (sinResultado.length ? `\nReuniones terminadas que esperan saber si la persona asistió:\n${sinResultado.map(descripcionTurno).join('\n')}` : '');
 }
 
 // Avisos del sistema y acciones hechas con un "sí" directo quedan en la conversación del asistente.
@@ -3115,6 +3172,16 @@ async function procesarMensajeAdmin(sock, sender, text) {
         }
         if (consultas.length === 1 && !pendientes.length) {
             const r = esAfirmativo(text) ? await aceptarConsulta({ telefono: consultas[0].telefono }) : await rechazarConsulta({ telefono: consultas[0].telefono });
+            return responder(r.mensaje);
+        }
+    }
+
+    // 2b) "Asistió" / "no vino" cuando hay una sola reunión terminada esperando ese dato.
+    const asistencia = asistenciaDelAdmin(text);
+    if (asistencia) {
+        const sin = await reunionesSinResultado();
+        if (sin.length === 1) {
+            const r = await registrarResultado({ turno_id: sin[0].id, resultado: asistencia });
             return responder(r.mensaje);
         }
     }
@@ -3228,6 +3295,7 @@ async function revisarTareas() {
             if (new Date(t.inicio).getTime() - ahora < 60 * 60000) {
                 await actualizarTurno(t.id, { estado: 'vencido', cambio: null });
                 await recordarConsultaDeTurno(t);
+                await hsSinReunion(t, 'El pedido venció sin confirmación');
                 await enviarACliente(t.telefono, `Disculpe, no pudimos confirmar a tiempo la reunión del ${etiquetaTurno(t.inicio)}. Si lo desea, le ofrezco nuevos horarios.`).catch(() => {});
                 await enviarAAdmin(`⌛ El pedido #${t.id} de ${t.nombre || 'un cliente'} (${etiquetaTurno(t.inicio)}) venció sin confirmación. Le avisé al cliente.`);
                 continue;
@@ -3282,11 +3350,337 @@ async function revisarTareas() {
             }
             if (JSON.stringify(nuevos) !== JSON.stringify(hechos)) await actualizarTurno(t.id, { recordatorios: JSON.stringify(nuevos) });
         }
+
+        // Al terminar una reunión: te pregunta si la persona asistió (para el seguimiento en HubSpot).
+        const { rows: terminadas } = await db.query(
+            `SELECT * FROM turnos WHERE estado = 'confirmado' AND resultado IS NULL AND fin < NOW() - INTERVAL '10 minutes' AND fin > NOW() - INTERVAL '6 hours'
+             AND (recordatorios->>'post') IS NULL`);
+        for (const t of terminadas) {
+            await actualizarTurno(t.id, { recordatorios: JSON.stringify({ ...(t.recordatorios || {}), post: 'enviado' }) });
+            const c = await obtenerContacto(t.telefono);
+            await enviarAAdmin(`📋 Terminó la reunión #${t.id} con ${etiquetaContacto(c || t, t.nombre || 'el cliente')} (${t.producto || 'consulta'}, ${etiquetaTurno(t.inicio)}).\n\n¿Asistió? Respondé *asistió* o *no vino*. Después podés decirme "le mandé la propuesta", "contrató" o "no siguió".`, { anotar: true });
+        }
+
+        // HubSpot: envía lo pendiente (y reintenta lo que falló) cada 5 minutos.
+        if (HUBSPOT_TOKEN && ahora - ultimaSyncHubspot > 5 * 60000) await sincronizarHubspot();
     } catch (e) {
         console.error('Error en tareas programadas:', e.message);
     } finally {
         revisandoTareas = false;
     }
+}
+
+// ==================== 12b. HubSpot (CRM) ====================
+// El bot lleva sus propios "negocios" en la base (uno por consulta) y los envía a HubSpot. Si HubSpot no responde,
+// el bot sigue igual y reintenta en la próxima revisión: nunca se traba una reunión por HubSpot.
+
+const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || '';
+const ETAPAS_NEGOCIO = ['Consulta', 'Reunión pedida', 'Reunión confirmada', 'Asistió', 'No asistió', 'Propuesta enviada', 'Ganado', 'Perdido'];
+const RESULTADOS = { asistio: 'Asistió', no_asistio: 'No asistió', propuesta_enviada: 'Propuesta enviada', ganado: 'Ganado', perdido: 'Perdido' };
+let etapasHubspot = null;      // { pipeline, ids, faltan, leidas }
+let ultimoErrorHubspot = null; // { mensaje, en }
+let ultimaSyncHubspot = 0;
+let avisoEtapasEnviado = false;
+
+function apiHubspot(metodo, ruta, cuerpo = null) {
+    return solicitudHttps(metodo, `https://api.hubapi.com${ruta}`, {
+        headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, ...(cuerpo ? { 'Content-Type': 'application/json' } : {}) },
+        cuerpo
+    });
+}
+
+function fechaCorta(d = new Date()) {
+    const p = partesBA(d);
+    return `${p.fecha.slice(8, 10)}/${p.fecha.slice(5, 7)} ${p.hora}`;
+}
+
+// --- Negocios locales ---
+
+async function negociosAbiertos(telefono) {
+    const { rows } = await db.query(`SELECT * FROM negocios WHERE telefono = $1 AND NOT cerrado ORDER BY id DESC`, [telefono]);
+    return rows;
+}
+
+async function obtenerNegocio(id) {
+    const { rows } = await db.query('SELECT * FROM negocios WHERE id = $1', [id]);
+    return rows[0] || null;
+}
+
+function programarSyncHubspot() {
+    if (!HUBSPOT_TOKEN || process.env.HUBSPOT_SYNC_MANUAL) return;
+    clearTimeout(programarSyncHubspot.timer);
+    programarSyncHubspot.timer = setTimeout(() => sincronizarHubspot().catch(e => console.error('HubSpot:', e.message)), 3000);
+}
+
+// Abre un negocio para la consulta (o usa el que ya está abierto). nuevo=true: uno aparte (otro tema), salvo que ya
+// exista uno abierto con el mismo título.
+async function abrirNegocio(telefono, { especialidad = null, motivo = null, interes = null, titulo = null, nuevo = false, nota = null } = {}) {
+    if (!dbOk) return null;
+    const tit = String(titulo || especialidad || 'Consulta').slice(0, 200); // el tema; el nombre se agrega al enviarlo
+    const abiertos = await negociosAbiertos(telefono);
+    let g = nuevo ? abiertos.find(x => x.titulo === tit) : abiertos[0];
+    if (!g) {
+        const { rows } = await db.query(
+            `INSERT INTO negocios (telefono, titulo, especialidad, motivo, interes, historial) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            [telefono, tit, especialidad, motivo, interes, `${fechaCorta()} · Consulta por WhatsApp${nota ? ` (${nota})` : ''}`]);
+        g = rows[0];
+    } else {
+        const campos = {};
+        if (especialidad && !g.especialidad) campos.especialidad = especialidad;
+        if (motivo && motivo !== g.motivo) campos.motivo = motivo;
+        if (interes && interes !== g.interes) campos.interes = interes;
+        if (Object.keys(campos).length) await actualizarNegocio(g.id, campos, nota);
+        else if (nota) await actualizarNegocio(g.id, {}, nota);
+    }
+    programarSyncHubspot();
+    return g;
+}
+
+async function actualizarNegocio(id, campos = {}, nota = null) {
+    const g = await obtenerNegocio(id);
+    if (!g) return null;
+    if (nota) campos.historial = `${g.historial ? g.historial + '\n' : ''}${fechaCorta()} · ${nota}`.slice(-5000);
+    if (campos.etapa) campos.cerrado = ['Ganado', 'Perdido'].includes(campos.etapa);
+    const claves = Object.keys(campos);
+    const sets = claves.map((k, i) => `${k} = $${i + 2}`).join(', ');
+    await db.query(`UPDATE negocios SET ${sets}${sets ? ', ' : ''}sincronizado = FALSE, actualizado_en = NOW() WHERE id = $1`, [id, ...claves.map(k => campos[k])]);
+    programarSyncHubspot();
+    return obtenerNegocio(id);
+}
+
+// El negocio de una reunión: el que tiene asignado, o el abierto del contacto (o uno nuevo).
+async function negocioDeTurno(t, { nuevo = false } = {}) {
+    if (t.negocio_id) { const g = await obtenerNegocio(t.negocio_id); if (g) return g; }
+    const g = await abrirNegocio(t.telefono, { especialidad: t.producto, motivo: t.motivo, interes: t.interes, nuevo });
+    if (g) await db.query('UPDATE turnos SET negocio_id = $2 WHERE id = $1', [t.id, g.id]);
+    return g;
+}
+
+// Ganchos desde el resto del bot. Nunca cortan el flujo si algo falla.
+async function hsPedido(t, { separada = false } = {}) {
+    try {
+        const g = await negocioDeTurno(t, { nuevo: separada });
+        if (g) await actualizarNegocio(g.id, { etapa: 'Reunión pedida' }, `Pidió reunión para el ${etiquetaTurno(t.inicio)} (#${t.id})${separada ? ' · reunión aparte' : ''}`);
+    } catch (e) { console.error('HubSpot (pedido):', e.message); }
+}
+
+async function hsConfirmada(t, nota = null) {
+    try {
+        const g = await negocioDeTurno(t);
+        if (g) await actualizarNegocio(g.id, { etapa: 'Reunión confirmada' }, nota || `Reunión confirmada para el ${etiquetaTurno(t.inicio)} (#${t.id})`);
+    } catch (e) { console.error('HubSpot (confirmada):', e.message); }
+}
+
+async function hsNota(t, nota) {
+    try {
+        const g = await negocioDeTurno(t);
+        if (g) await actualizarNegocio(g.id, {}, nota);
+    } catch (e) { console.error('HubSpot (nota):', e.message); }
+}
+
+// La reunión no se hace (cancelada, vencida, sin disponibilidad): si no le queda otra, el negocio vuelve a "Consulta".
+async function hsSinReunion(t, nota) {
+    try {
+        if (!t.negocio_id) return;
+        const g = await obtenerNegocio(t.negocio_id);
+        if (!g || g.cerrado) return;
+        const { rows: [o] } = await db.query(`SELECT COUNT(*)::int AS n FROM turnos WHERE negocio_id = $1 AND id <> $2 AND estado = ANY($3) AND fin > NOW()`, [g.id, t.id, ESTADOS_VIGENTES]);
+        const campos = o.n === 0 && ['Reunión pedida', 'Reunión confirmada'].includes(g.etapa) ? { etapa: 'Consulta' } : {};
+        await actualizarNegocio(g.id, campos, `${nota} (#${t.id}, ${etiquetaTurno(t.inicio)})`);
+    } catch (e) { console.error('HubSpot (sin reunión):', e.message); }
+}
+
+async function hsContactoCambio(telefono) {
+    try {
+        await db.query('UPDATE contactos SET hubspot_sincronizado = FALSE WHERE telefono = $1', [telefono]);
+        programarSyncHubspot();
+    } catch (e) { /* sigue */ }
+}
+
+// --- El administrador registra cómo siguió: asistió, no asistió, propuesta enviada, ganado, perdido ---
+
+async function registrarResultado({ cliente, turno_id, resultado, nota }) {
+    const etapa = RESULTADOS[resultado];
+    if (!etapa) return { ok: false, mensaje: 'Decime si asistió, no asistió, se le envió la propuesta, contrató o no siguió.' };
+    let t = turno_id ? await obtenerTurno(turno_id) : null;
+    let telefono = t?.telefono || null;
+    if (!telefono && cliente) {
+        const c = await buscarContacto(cliente);
+        if (c.error) return { ok: false, mensaje: c.error };
+        telefono = c.telefono;
+    }
+    if (!telefono) return { ok: false, mensaje: 'Decime de qué cliente se trata.' };
+    let g = t ? await negocioDeTurno(t) : null;
+    if (!g) {
+        const abiertos = await negociosAbiertos(telefono);
+        if (abiertos.length > 1) return { ok: false, mensaje: `Tiene ${abiertos.length} consultas abiertas: ${abiertos.map(x => `"${x.titulo}"`).join(' y ')}. ¿Cuál? (o decime el número de la reunión)` };
+        g = abiertos[0] || null;
+        if (!g) {
+            const { rows: [ult] } = await db.query(`SELECT * FROM turnos WHERE telefono = $1 ORDER BY inicio DESC LIMIT 1`, [telefono]);
+            if (ult) { t = ult; g = await negocioDeTurno(ult); } else g = await abrirNegocio(telefono, {});
+        }
+    }
+    if (!t) { const { rows: [ult] } = await db.query(`SELECT * FROM turnos WHERE negocio_id = $1 ORDER BY inicio DESC LIMIT 1`, [g.id]); t = ult || null; }
+    if (t && ['asistio', 'no_asistio'].includes(resultado)) await db.query('UPDATE turnos SET resultado = $2 WHERE id = $1', [t.id, resultado]);
+    await actualizarNegocio(g.id, { etapa }, `${etapa}${nota ? `: ${nota}` : ''}`);
+    let extra = '';
+    if (resultado === 'ganado') {
+        await db.query('UPDATE contactos SET es_cliente = TRUE, hubspot_sincronizado = FALSE WHERE telefono = $1', [telefono]);
+        extra = ' Además quedó marcado como ⭐ cliente.';
+    }
+    const c = await obtenerContacto(telefono);
+    return { ok: true, mensaje: `Listo, ${etiquetaContacto(c || {}, 'el cliente')}: "${g.titulo}" pasó a *${etapa}*.${extra}${HUBSPOT_TOKEN ? '' : ' (HubSpot todavía no está conectado: queda guardado y se envía cuando cargues HUBSPOT_TOKEN.)'}` };
+}
+
+// Reuniones que ya terminaron y esperan que digas si la persona asistió.
+async function reunionesSinResultado() {
+    const { rows } = await db.query(`SELECT * FROM turnos WHERE estado = 'confirmado' AND resultado IS NULL AND recordatorios->>'post' = 'enviado' AND fin > NOW() - INTERVAL '3 days' ORDER BY inicio`);
+    return rows;
+}
+
+function asistenciaDelAdmin(texto) {
+    const t = normalizarTexto(texto);
+    if (/^(no )?(no asistio|no vino|no se conecto|no aparecio|falto|no show|no estuvo)\b/.test(t)) return 'no_asistio';
+    if (/^(si )?(asistio|vino|se conecto|estuvo|participo)\b/.test(t)) return 'asistio';
+    return null;
+}
+
+// --- Envío a HubSpot ---
+
+async function cargarEtapasHubspot() {
+    if (etapasHubspot && Date.now() - etapasHubspot.leidas < 6 * 3600000) return etapasHubspot;
+    const r = await apiHubspot('GET', '/crm/v3/pipelines/deals');
+    if (r.status !== 200) throw new Error(`no pude leer el pipeline (${r.status}${r.json?.category ? ' ' + r.json.category : ''})`);
+    const lista = r.json?.results || [];
+    const p = lista.find(x => x.id === 'default') || lista[0];
+    if (!p) throw new Error('la cuenta no tiene ningún pipeline de negocios');
+    const ids = {};
+    for (const s of p.stages || []) ids[normalizarTexto(s.label)] = s.id;
+    etapasHubspot = { pipeline: p.id, ids, faltan: ETAPAS_NEGOCIO.filter(e => !ids[normalizarTexto(e)]), leidas: Date.now() };
+    if (etapasHubspot.faltan.length && !avisoEtapasEnviado) {
+        avisoEtapasEnviado = true;
+        await enviarAAdmin(`⚠️ En HubSpot faltan estas etapas del negocio: ${etapasHubspot.faltan.join(', ')}. Revisalas en Configuración → Objetos → Negocios → Pipelines (el nombre tiene que coincidir).`);
+    }
+    return etapasHubspot;
+}
+
+function separarNombre(nombre) {
+    const partes = String(nombre || '').replace(/^(sr|sra|srta|dr|dra)\.?\s+/i, '').trim().split(/\s+/).filter(Boolean);
+    if (!partes.length) return {};
+    return { firstname: partes[0], ...(partes.length > 1 ? { lastname: partes.slice(1).join(' ') } : {}) };
+}
+
+function propiedadesContacto(c, { crear = false } = {}) {
+    const p = {};
+    if (c.nombre && !/^no (indicado|detectado)$/i.test(c.nombre)) Object.assign(p, separarNombre(c.nombre));
+    if (c.numero) p.phone = `+${c.numero}`;
+    if (c.email && REGEX_EMAIL.test(c.email)) p.email = c.email.trim().toLowerCase();
+    if (c.es_cliente) p.lifecyclestage = 'customer';
+    else if (crear) p.lifecyclestage = 'lead';
+    return p;
+}
+
+// Devuelve el id del contacto en HubSpot (lo busca por teléfono o lo crea).
+async function contactoHubspot(telefono) {
+    const { rows: [c] } = await db.query('SELECT * FROM contactos WHERE telefono = $1', [telefono]);
+    if (!c) return null;
+    let id = c.hubspot_id;
+    if (!id && c.numero) {
+        const r = await apiHubspot('POST', '/crm/v3/objects/contacts/search', { filterGroups: [{ filters: [{ propertyName: 'phone', operator: 'EQ', value: `+${c.numero}` }] }], limit: 1 });
+        if (r.status === 200 && r.json?.results?.length) id = r.json.results[0].id;
+    }
+    if (!id) {
+        const r = await apiHubspot('POST', '/crm/v3/objects/contacts', { properties: propiedadesContacto(c, { crear: true }) });
+        if (r.status === 201 || r.status === 200) id = r.json.id;
+        else if (r.status === 409) id = (String(r.json?.message || r.texto).match(/Existing ID:\s*(\d+)/) || [])[1];
+        if (!id) throw new Error(`contacto (${r.status}${r.json?.message ? ': ' + r.json.message.slice(0, 120) : ''})`);
+        await db.query('UPDATE contactos SET hubspot_id = $2, hubspot_sincronizado = TRUE WHERE telefono = $1', [telefono, id]);
+        return id;
+    }
+    if (id !== c.hubspot_id || !c.hubspot_sincronizado) {
+        const r = await apiHubspot('PATCH', `/crm/v3/objects/contacts/${id}`, { properties: propiedadesContacto(c) });
+        if (r.status === 404) { await db.query('UPDATE contactos SET hubspot_id = NULL WHERE telefono = $1', [telefono]); return contactoHubspot(telefono); }
+        if (r.status !== 200) throw new Error(`contacto (${r.status})`);
+        await db.query('UPDATE contactos SET hubspot_id = $2, hubspot_sincronizado = TRUE WHERE telefono = $1', [telefono, id]);
+    }
+    return id;
+}
+
+function descripcionNegocio(g, c) {
+    return [
+        'Origen: WhatsApp (bot del Estudio)',
+        c?.numero ? `Teléfono: +${c.numero}` : null,
+        g.especialidad ? `Especialidad: ${g.especialidad}` : null,
+        g.interes ? `Interés: ${g.interes}` : null,
+        g.motivo ? `Motivo: ${g.motivo}` : null,
+        '',
+        '— Historial —',
+        g.historial || ''
+    ].filter(x => x !== null).join('\n').slice(0, 6000);
+}
+
+async function enviarNegocio(g, et) {
+    const c = await obtenerContacto(g.telefono);
+    const contactoId = c ? await contactoHubspot(g.telefono) : null;
+    const nombre = c?.nombre && !/^no (indicado|detectado)$/i.test(c.nombre) ? c.nombre : (c?.numero ? `+${c.numero}` : 'Contacto de WhatsApp');
+    const properties = { dealname: `${nombre} · ${g.titulo || 'Consulta'}`.slice(0, 250), pipeline: et.pipeline, description: descripcionNegocio(g, c) };
+    const etapa = et.ids[normalizarTexto(g.etapa)];
+    if (etapa) properties.dealstage = etapa;
+    if (g.cerrado) properties.closedate = new Date(g.actualizado_en || Date.now()).toISOString();
+    let id = g.hubspot_id;
+    if (id) {
+        const r = await apiHubspot('PATCH', `/crm/v3/objects/deals/${id}`, { properties });
+        if (r.status === 404) id = null;
+        else if (r.status !== 200) throw new Error(`negocio (${r.status}${r.json?.message ? ': ' + r.json.message.slice(0, 120) : ''})`);
+    }
+    if (!id) {
+        const cuerpo = { properties };
+        if (contactoId) cuerpo.associations = [{ to: { id: contactoId }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 3 }] }];
+        const r = await apiHubspot('POST', '/crm/v3/objects/deals', cuerpo);
+        if (r.status !== 201 && r.status !== 200) throw new Error(`negocio (${r.status}${r.json?.message ? ': ' + r.json.message.slice(0, 120) : ''})`);
+        id = r.json.id;
+    }
+    await db.query('UPDATE negocios SET hubspot_id = $2, sincronizado = TRUE, error = NULL WHERE id = $1 AND actualizado_en = $3', [g.id, id, g.actualizado_en]);
+    await db.query('UPDATE negocios SET hubspot_id = $2 WHERE id = $1', [g.id, id]);
+}
+
+let sincronizandoHubspot = false;
+async function sincronizarHubspot() {
+    if (!HUBSPOT_TOKEN || !dbOk || sincronizandoHubspot) return { omitido: true };
+    sincronizandoHubspot = true;
+    let enviados = 0, errores = 0;
+    try {
+        ultimaSyncHubspot = Date.now();
+        const et = await cargarEtapasHubspot();
+        const { rows: negocios } = await db.query('SELECT * FROM negocios WHERE NOT sincronizado ORDER BY id LIMIT 30');
+        for (const g of negocios) {
+            try { await enviarNegocio(g, et); enviados++; } catch (e) {
+                errores++;
+                ultimoErrorHubspot = { mensaje: e.message, en: new Date() };
+                await db.query('UPDATE negocios SET error = $2 WHERE id = $1', [g.id, e.message.slice(0, 300)]);
+            }
+        }
+        const { rows: contactos } = await db.query('SELECT telefono FROM contactos WHERE hubspot_id IS NOT NULL AND NOT hubspot_sincronizado LIMIT 30');
+        for (const c of contactos) {
+            try { await contactoHubspot(c.telefono); enviados++; } catch (e) { errores++; ultimoErrorHubspot = { mensaje: e.message, en: new Date() }; }
+        }
+        if (!errores && enviados) ultimoErrorHubspot = null;
+    } catch (e) {
+        ultimoErrorHubspot = { mensaje: e.message, en: new Date() };
+        errores++;
+    } finally {
+        sincronizandoHubspot = false;
+    }
+    return { enviados, errores };
+}
+
+async function estadoHubspot() {
+    if (!HUBSPOT_TOKEN) return '🧲 HubSpot: ⚠️ sin conectar (falta HUBSPOT_TOKEN en Railway)';
+    const { rows: [p] } = await db.query('SELECT COUNT(*)::int AS n FROM negocios WHERE NOT sincronizado');
+    const { rows: [t] } = await db.query('SELECT COUNT(*)::int AS n FROM negocios');
+    const lineas = [`🧲 HubSpot: ${ultimoErrorHubspot ? `❌ ${ultimoErrorHubspot.mensaje}` : '✅ conectado'}`, `   • Negocios: ${t.n} (pendientes de enviar: ${p.n})`];
+    if (etapasHubspot?.faltan?.length) lineas.push(`   • Faltan etapas: ${etapasHubspot.faltan.join(', ')}`);
+    return lineas.join('\n');
 }
 
 // ==================== 13. Comandos de respaldo ====================
@@ -3355,6 +3749,7 @@ async function estadoSistema() {
         const ok = await obtenerTokenGoogle();
         lineas.push(`📅 Google Calendar: ${ok ? `✅ conectado (${await leerConfig('google_cuenta')})` : '❌ el permiso falló, volvé a conectar'}`);
     }
+    lineas.push(await estadoHubspot().catch(e => `🧲 HubSpot: ❌ ${e.message}`));
     lineas.push(`📋 Reglas de administrador: ${globalAdminRules.length}`);
     lineas.push(`🔐 Sesión de WhatsApp en: ${AUTH_FOLDER}`);
     lineas.push(`⏱️ Encendido desde: ${formatoFecha(iniciadoEn)}`);
@@ -3541,7 +3936,7 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
