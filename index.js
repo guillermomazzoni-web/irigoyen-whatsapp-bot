@@ -229,6 +229,8 @@ async function inicializarDB() {
         await db.query(`ALTER TABLE turnos ADD COLUMN IF NOT EXISTS resultado TEXT`);
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_id TEXT`);
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_sincronizado BOOLEAN DEFAULT FALSE`);
+        await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_borrado BOOLEAN DEFAULT FALSE`);
+        await db.query(`ALTER TABLE negocios ADD COLUMN IF NOT EXISTS borrado_hubspot BOOLEAN DEFAULT FALSE`);
         await migrarTurnosV12();
         dbOk = true;
         console.log('✅ Base de datos inicializada correctamente.');
@@ -1065,11 +1067,24 @@ function limpiarTratamiento(texto) {
     return String(texto || '').replace(/\b(Sr|Sra|Srta)\.?\s+(?:(?:Sr|Sra|Srta)\.?\s+)+/g, '$1. ');
 }
 
+// Ningún envío por WhatsApp puede dejar al bot esperando para siempre (pasa cuando la conexión se corta a mitad de camino).
+const LIMITE_WHATSAPP_MS = Number(process.env.WHATSAPP_TIMEOUT_MS) || 15000;
+function conLimite(promesa, ms, que) {
+    let timer;
+    return Promise.race([
+        promesa,
+        new Promise((_, rechazar) => { timer = setTimeout(() => rechazar(new Error(`${que}: sin respuesta en ${Math.round(ms / 1000)} s`)), ms); })
+    ]).finally(() => clearTimeout(timer));
+}
+function enviarWhatsApp(sock, jid, contenido) {
+    return conLimite(Promise.resolve().then(() => sock.sendMessage(jid, contenido)), LIMITE_WHATSAPP_MS, 'WhatsApp');
+}
+
 // Mensajes que el sistema manda por su cuenta: quedan guardados en el historial del cliente.
 async function enviarACliente(telefono, texto) {
     if (!socketActual) throw new Error('WhatsApp no está conectado');
     texto = limpiarTratamiento(texto);
-    await socketActual.sendMessage(telefono, { text: texto });
+    await enviarWhatsApp(socketActual, telefono, { text: texto });
     await guardarMensaje(telefono, 'bot', texto);
     userHistories.delete(telefono); // se recarga desde la base en el próximo mensaje
 }
@@ -1078,7 +1093,7 @@ async function enviarACliente(telefono, texto) {
 async function enviarAAdmin(texto, { anotar = false } = {}) {
     if (!socketActual || !ADMIN_NUMBER) return;
     try {
-        await socketActual.sendMessage(await obtenerJidAdmin(socketActual), { text: texto });
+        await enviarWhatsApp(socketActual, await obtenerJidAdmin(socketActual), { text: texto });
         if (anotar) anotarAvisoEnHistorialAdmin(texto);
     } catch (e) {
         console.error('Error enviando mensaje al administrador:', e.message);
@@ -2760,7 +2775,7 @@ async function obtenerJidAdmin(sock) {
     if (!jidAdminConocido) jidAdminConocido = await leerConfig('admin_jid');
     if (jidAdminConocido) return jidAdminConocido;
     try {
-        const [resultado] = await sock.onWhatsApp(ADMIN_NUMBER);
+        const [resultado] = await conLimite(Promise.resolve().then(() => sock.onWhatsApp(ADMIN_NUMBER)), LIMITE_WHATSAPP_MS, 'WhatsApp');
         if (resultado?.exists && resultado.jid) return resultado.jid;
     } catch (e) { /* usa fallback */ }
     return `${ADMIN_NUMBER}@s.whatsapp.net`;
@@ -3278,10 +3293,17 @@ function textoRecordatorioAdmin(clave, t) {
 }
 
 let revisandoTareas = false;
+let revisandoDesde = 0;
+let ultimaVueltaTareas = 0;
 
 async function revisarTareas() {
+    if (revisandoTareas && Date.now() - revisandoDesde > 5 * 60000) {
+        console.error('⚠️ Tareas programadas: la vuelta anterior quedó trabada más de 5 minutos; se libera.');
+        revisandoTareas = false;
+    }
     if (revisandoTareas || !dbOk || !isConnected) return;
     revisandoTareas = true;
+    revisandoDesde = Date.now();
     try {
         const ahora = Date.now();
 
@@ -3361,13 +3383,18 @@ async function revisarTareas() {
             await enviarAAdmin(`📋 Terminó la reunión #${t.id} con ${etiquetaContacto(c || t, t.nombre || 'el cliente')} (${t.producto || 'consulta'}, ${etiquetaTurno(t.inicio)}).\n\n¿Asistió? Respondé *asistió* o *no vino*. Después podés decirme "le mandé la propuesta", "contrató" o "no siguió".`, { anotar: true });
         }
 
-        // HubSpot: envía lo pendiente (y reintenta lo que falló) cada 5 minutos.
-        if (HUBSPOT_TOKEN && ahora - ultimaSyncHubspot > 5 * 60000) await sincronizarHubspot();
+        ultimaVueltaTareas = Date.now();
     } catch (e) {
         console.error('Error en tareas programadas:', e.message);
     } finally {
         revisandoTareas = false;
     }
+}
+
+// HubSpot va aparte de las demás tareas: un problema en otra parte no lo frena.
+async function revisarHubspot() {
+    if (!HUBSPOT_TOKEN || !dbOk || Date.now() - ultimaSyncHubspot < 5 * 60000) return;
+    await sincronizarHubspot().catch(e => console.error('HubSpot:', e.message));
 }
 
 // ==================== 12b. HubSpot (CRM) ====================
@@ -3581,10 +3608,15 @@ function propiedadesContacto(c, { crear = false } = {}) {
 }
 
 // Devuelve el id del contacto en HubSpot (lo busca por teléfono o lo crea).
-async function contactoHubspot(telefono) {
+// crear=false: solo actualiza; si lo borraron en HubSpot, no lo vuelve a crear.
+async function contactoHubspot(telefono, { crear = true } = {}) {
     const { rows: [c] } = await db.query('SELECT * FROM contactos WHERE telefono = $1', [telefono]);
     if (!c) return null;
-    let id = c.hubspot_id;
+    if (c.hubspot_borrado && !crear) {
+        await db.query('UPDATE contactos SET hubspot_sincronizado = TRUE WHERE telefono = $1', [telefono]);
+        return null;
+    }
+    let id = c.hubspot_borrado ? null : c.hubspot_id;
     if (!id && c.numero) {
         const r = await apiHubspot('POST', '/crm/v3/objects/contacts/search', { filterGroups: [{ filters: [{ propertyName: 'phone', operator: 'EQ', value: `+${c.numero}` }] }], limit: 1 });
         if (r.status === 200 && r.json?.results?.length) id = r.json.results[0].id;
@@ -3594,12 +3626,16 @@ async function contactoHubspot(telefono) {
         if (r.status === 201 || r.status === 200) id = r.json.id;
         else if (r.status === 409) id = (String(r.json?.message || r.texto).match(/Existing ID:\s*(\d+)/) || [])[1];
         if (!id) throw new Error(`contacto (${r.status}${r.json?.message ? ': ' + r.json.message.slice(0, 120) : ''})`);
-        await db.query('UPDATE contactos SET hubspot_id = $2, hubspot_sincronizado = TRUE WHERE telefono = $1', [telefono, id]);
+        await db.query('UPDATE contactos SET hubspot_id = $2, hubspot_sincronizado = TRUE, hubspot_borrado = FALSE WHERE telefono = $1', [telefono, id]);
         return id;
     }
     if (id !== c.hubspot_id || !c.hubspot_sincronizado) {
         const r = await apiHubspot('PATCH', `/crm/v3/objects/contacts/${id}`, { properties: propiedadesContacto(c) });
-        if (r.status === 404) { await db.query('UPDATE contactos SET hubspot_id = NULL WHERE telefono = $1', [telefono]); return contactoHubspot(telefono); }
+        if (r.status === 404) {
+            // Lo borraron en HubSpot: se respeta. Solo se vuelve a crear si llega una consulta nueva de esa persona.
+            await db.query('UPDATE contactos SET hubspot_borrado = TRUE, hubspot_sincronizado = TRUE WHERE telefono = $1', [telefono]);
+            return crear ? contactoHubspot(telefono, { crear: true }) : null;
+        }
         if (r.status !== 200) throw new Error(`contacto (${r.status})`);
         await db.query('UPDATE contactos SET hubspot_id = $2, hubspot_sincronizado = TRUE WHERE telefono = $1', [telefono, id]);
     }
@@ -3620,8 +3656,9 @@ function descripcionNegocio(g, c) {
 }
 
 async function enviarNegocio(g, et) {
+    if (g.borrado_hubspot) { await db.query('UPDATE negocios SET sincronizado = TRUE WHERE id = $1', [g.id]); return 'borrado'; }
     const c = await obtenerContacto(g.telefono);
-    const contactoId = c ? await contactoHubspot(g.telefono) : null;
+    const contactoId = c ? await contactoHubspot(g.telefono, { crear: !g.hubspot_id }) : null;
     const nombre = c?.nombre && !/^no (indicado|detectado)$/i.test(c.nombre) ? c.nombre : (c?.numero ? `+${c.numero}` : 'Contacto de WhatsApp');
     const properties = { dealname: `${nombre} · ${g.titulo || 'Consulta'}`.slice(0, 250), pipeline: et.pipeline, description: descripcionNegocio(g, c) };
     const etapa = et.ids[normalizarTexto(g.etapa)];
@@ -3630,8 +3667,11 @@ async function enviarNegocio(g, et) {
     let id = g.hubspot_id;
     if (id) {
         const r = await apiHubspot('PATCH', `/crm/v3/objects/deals/${id}`, { properties });
-        if (r.status === 404) id = null;
-        else if (r.status !== 200) throw new Error(`negocio (${r.status}${r.json?.message ? ': ' + r.json.message.slice(0, 120) : ''})`);
+        if (r.status === 404) {
+            // Lo borraron en HubSpot: no se vuelve a crear.
+            await db.query('UPDATE negocios SET borrado_hubspot = TRUE, sincronizado = TRUE, error = NULL WHERE id = $1', [g.id]);
+            return 'borrado';
+        } else if (r.status !== 200) throw new Error(`negocio (${r.status}${r.json?.message ? ': ' + r.json.message.slice(0, 120) : ''})`);
     }
     if (!id) {
         const cuerpo = { properties };
@@ -3640,45 +3680,85 @@ async function enviarNegocio(g, et) {
         if (r.status !== 201 && r.status !== 200) throw new Error(`negocio (${r.status}${r.json?.message ? ': ' + r.json.message.slice(0, 120) : ''})`);
         id = r.json.id;
     }
-    await db.query('UPDATE negocios SET hubspot_id = $2, sincronizado = TRUE, error = NULL WHERE id = $1 AND actualizado_en = $3', [g.id, id, g.actualizado_en]);
-    await db.query('UPDATE negocios SET hubspot_id = $2 WHERE id = $1', [g.id, id]);
+    // Queda como enviado, salvo que haya cambiado mientras se enviaba (la base guarda microsegundos; JavaScript, milisegundos).
+    await db.query(`UPDATE negocios SET hubspot_id = $2, error = NULL,
+        sincronizado = (actualizado_en < $3::timestamptz + INTERVAL '1 millisecond') WHERE id = $1`, [g.id, id, g.actualizado_en]);
+    return 'enviado';
 }
 
 let sincronizandoHubspot = false;
+let sincronizandoDesde = 0;
+let ultimaSyncOkHubspot = null;
 async function sincronizarHubspot() {
+    if (sincronizandoHubspot && Date.now() - sincronizandoDesde > 5 * 60000) sincronizandoHubspot = false; // quedó trabado: se libera
     if (!HUBSPOT_TOKEN || !dbOk || sincronizandoHubspot) return { omitido: true };
     sincronizandoHubspot = true;
-    let enviados = 0, errores = 0;
+    sincronizandoDesde = Date.now();
+    const r = { enviados: 0, contactos: 0, borrados: 0, errores: 0, detalle: [], pipeline: null };
     try {
         ultimaSyncHubspot = Date.now();
         const et = await cargarEtapasHubspot();
+        r.pipeline = { faltan: et.faltan };
         const { rows: negocios } = await db.query('SELECT * FROM negocios WHERE NOT sincronizado ORDER BY id LIMIT 30');
         for (const g of negocios) {
-            try { await enviarNegocio(g, et); enviados++; } catch (e) {
-                errores++;
+            try {
+                const res = await enviarNegocio(g, et);
+                if (res === 'borrado') r.borrados++; else r.enviados++;
+            } catch (e) {
+                r.errores++;
+                r.detalle.push(`Negocio "${g.titulo}": ${e.message}`);
                 ultimoErrorHubspot = { mensaje: e.message, en: new Date() };
                 await db.query('UPDATE negocios SET error = $2 WHERE id = $1', [g.id, e.message.slice(0, 300)]);
             }
         }
         const { rows: contactos } = await db.query('SELECT telefono FROM contactos WHERE hubspot_id IS NOT NULL AND NOT hubspot_sincronizado LIMIT 30');
         for (const c of contactos) {
-            try { await contactoHubspot(c.telefono); enviados++; } catch (e) { errores++; ultimoErrorHubspot = { mensaje: e.message, en: new Date() }; }
+            try { if (await contactoHubspot(c.telefono, { crear: false })) r.contactos++; } catch (e) {
+                r.errores++; r.detalle.push(`Contacto: ${e.message}`); ultimoErrorHubspot = { mensaje: e.message, en: new Date() };
+            }
         }
-        if (!errores && enviados) ultimoErrorHubspot = null;
+        if (!r.errores) { ultimoErrorHubspot = null; ultimaSyncOkHubspot = new Date(); }
     } catch (e) {
         ultimoErrorHubspot = { mensaje: e.message, en: new Date() };
-        errores++;
+        r.errores++;
+        r.detalle.push(e.message);
     } finally {
         sincronizandoHubspot = false;
     }
-    return { enviados, errores };
+    if (r.enviados || r.contactos || r.borrados || r.errores) {
+        console.log(`🧲 HubSpot: ${r.enviados} negocio(s) y ${r.contactos} contacto(s) enviados, ${r.borrados} borrado(s) en HubSpot (no se recrean), ${r.errores} error(es)${r.detalle.length ? ' — ' + r.detalle.join(' | ') : ''}`);
+    }
+    return r;
+}
+
+// "ADMIN HUBSPOT": envía ya y cuenta qué pasó.
+async function informeHubspot() {
+    if (!HUBSPOT_TOKEN) return '🧲 HubSpot no está conectado: falta la variable HUBSPOT_TOKEN en Railway.';
+    ultimaSyncHubspot = 0;
+    etapasHubspot = null; // vuelve a leer el pipeline: así se prueba la conexión de verdad
+    const r = await sincronizarHubspot();
+    if (r.omitido) return '🧲 Ya hay un envío a HubSpot en curso. Probá de nuevo en un minuto.';
+    const { rows: [p] } = await db.query('SELECT COUNT(*)::int AS n FROM negocios WHERE NOT sincronizado');
+    const lineas = ['🧲 *HubSpot*', ''];
+    lineas.push(r.pipeline ? `✅ Pipeline leído${r.pipeline.faltan.length ? ` · ⚠️ faltan etapas: ${r.pipeline.faltan.join(', ')}` : ' · las 8 etapas están'}` : '❌ No pude leer el pipeline');
+    lineas.push(`📤 Negocios enviados: ${r.enviados}`);
+    lineas.push(`👤 Contactos actualizados: ${r.contactos}`);
+    if (r.borrados) lineas.push(`🗑️ Borrados en HubSpot (no se vuelven a crear): ${r.borrados}`);
+    lineas.push(`⏳ Quedan pendientes: ${p.n}`);
+    if (r.errores) lineas.push('', `❌ Errores (${r.errores}):`, ...r.detalle.slice(0, 5).map(d => `• ${d}`));
+    else lineas.push('', 'Todo en orden.');
+    return lineas.join('\n');
 }
 
 async function estadoHubspot() {
     if (!HUBSPOT_TOKEN) return '🧲 HubSpot: ⚠️ sin conectar (falta HUBSPOT_TOKEN en Railway)';
     const { rows: [p] } = await db.query('SELECT COUNT(*)::int AS n FROM negocios WHERE NOT sincronizado');
     const { rows: [t] } = await db.query('SELECT COUNT(*)::int AS n FROM negocios');
-    const lineas = [`🧲 HubSpot: ${ultimoErrorHubspot ? `❌ ${ultimoErrorHubspot.mensaje}` : '✅ conectado'}`, `   • Negocios: ${t.n} (pendientes de enviar: ${p.n})`];
+    const { rows: [b] } = await db.query('SELECT COUNT(*)::int AS n FROM negocios WHERE borrado_hubspot');
+    const lineas = [`🧲 HubSpot: ${ultimoErrorHubspot ? `❌ ${ultimoErrorHubspot.mensaje}` : (ultimaSyncOkHubspot ? '✅ conectado' : '⏳ conectado, todavía sin envíos en esta sesión')}`,
+        `   • Negocios: ${t.n} (pendientes de enviar: ${p.n})`,
+        `   • Último envío correcto: ${ultimaSyncOkHubspot ? formatoFecha(ultimaSyncOkHubspot) : 'todavía ninguno desde que se encendió'}`];
+    if (b.n) lineas.push(`   • Borrados en HubSpot (no se recrean): ${b.n}`);
     if (etapasHubspot?.faltan?.length) lineas.push(`   • Faltan etapas: ${etapasHubspot.faltan.join(', ')}`);
     return lineas.join('\n');
 }
@@ -3686,7 +3766,7 @@ async function estadoHubspot() {
 // ==================== 13. Comandos de respaldo ====================
 // Funcionan aunque Gemini esté saturado.
 
-const REGEX_COMANDO_ADMIN = /^ADMIN\s+(ESTADO|MODELOS|CONECTAR\s+GOOGLE|AGENDA|AYUDA)$/i;
+const REGEX_COMANDO_ADMIN = /^ADMIN\s+(ESTADO|MODELOS|CONECTAR\s+GOOGLE|AGENDA|AYUDA|HUBSPOT)$/i;
 
 // Lista los modelos de Gemini que acepta esta clave, para elegir el de respaldo.
 function listarModelos() {
@@ -3750,6 +3830,8 @@ async function estadoSistema() {
         lineas.push(`📅 Google Calendar: ${ok ? `✅ conectado (${await leerConfig('google_cuenta')})` : '❌ el permiso falló, volvé a conectar'}`);
     }
     lineas.push(await estadoHubspot().catch(e => `🧲 HubSpot: ❌ ${e.message}`));
+    const haceMin = ultimaVueltaTareas ? Math.round((Date.now() - ultimaVueltaTareas) / 60000) : null;
+    lineas.push(`⏰ Tareas programadas (recordatorios): ${haceMin === null ? '⏳ todavía no corrieron' : haceMin <= 3 ? `✅ última vuelta hace ${haceMin} min` : `❌ última vuelta hace ${haceMin} min (deberían correr cada minuto)`}`);
     lineas.push(`📋 Reglas de administrador: ${globalAdminRules.length}`);
     lineas.push(`🔐 Sesión de WhatsApp en: ${AUTH_FOLDER}`);
     lineas.push(`⏱️ Encendido desde: ${formatoFecha(iniciadoEn)}`);
@@ -3764,6 +3846,11 @@ async function procesarComandoAdmin(sock, sender, text) {
         return;
     }
 
+    if (/^ADMIN\s+HUBSPOT$/i.test(comando)) {
+        await sock.sendMessage(sender, { text: await informeHubspot() });
+        return;
+    }
+
     if (/^ADMIN\s+AYUDA$/i.test(comando)) {
         await sock.sendMessage(sender, { text:
             '💬 Podés hablarme normal, por ejemplo: "¿qué tengo esta semana?", "el jueves no puedo", "el viernes atiendo de 14 a 16", "confirmale a Juan", "agregá una regla: ...".\n\n' +
@@ -3771,7 +3858,8 @@ async function procesarComandoAdmin(sock, sender, text) {
             '• ADMIN ESTADO: estado de WhatsApp, base, Gemini y agenda\n' +
             '• ADMIN MODELOS: modelos de Gemini disponibles\n' +
             '• ADMIN CONECTAR GOOGLE: link para conectar Google Calendar\n' +
-            '• ADMIN AGENDA: reuniones de los próximos 7 días, con su número'
+            '• ADMIN AGENDA: reuniones de los próximos 7 días, con su número\n' +
+            '• ADMIN HUBSPOT: envía ya lo pendiente a HubSpot y te dice qué pasó'
         });
         return;
     }
@@ -3926,6 +4014,7 @@ app.listen(PORT, async () => {
     if (dbOk) await cargarFeriados().catch(e => console.error('Feriados:', e.message));
     setTimeout(connectToWhatsApp, 5000);
     setInterval(revisarTareas, 60 * 1000);
+    setInterval(revisarHubspot, 60 * 1000);
 });
 
 module.exports = {
@@ -3936,7 +4025,7 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
