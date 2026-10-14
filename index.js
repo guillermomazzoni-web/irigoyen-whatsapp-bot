@@ -231,6 +231,20 @@ async function inicializarDB() {
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_sincronizado BOOLEAN DEFAULT FALSE`);
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_borrado BOOLEAN DEFAULT FALSE`);
         await db.query(`ALTER TABLE negocios ADD COLUMN IF NOT EXISTS borrado_hubspot BOOLEAN DEFAULT FALSE`);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS seguimientos (
+                id SERIAL PRIMARY KEY,
+                telefono TEXT NOT NULL,
+                turno_id INTEGER,
+                negocio_id INTEGER,
+                motivo TEXT NOT NULL,
+                paso INTEGER NOT NULL DEFAULT 0,
+                proximo TIMESTAMPTZ NOT NULL,
+                ultimo_envio TIMESTAMPTZ,
+                estado TEXT NOT NULL DEFAULT 'activo',
+                creado TIMESTAMPTZ DEFAULT NOW()
+            );
+        `);
         await migrarTurnosV12();
         dbOk = true;
         console.log('✅ Base de datos inicializada correctamente.');
@@ -1484,6 +1498,7 @@ async function reiniciarContacto({ cliente }) {
     const { rowCount: reuniones } = await db.query('DELETE FROM turnos WHERE telefono = $1', [tel]);
     await db.query('DELETE FROM mensajes WHERE telefono = $1', [tel]);
     await db.query('DELETE FROM negocios WHERE telefono = $1', [tel]);
+    await db.query('DELETE FROM seguimientos WHERE telefono = $1', [tel]);
     await db.query(`DELETE FROM configuracion WHERE right(clave, length($1) + 1) = ':' || $1`, [tel]);
     await db.query('DELETE FROM contactos WHERE telefono = $1', [tel]);
     userHistories.delete(tel);
@@ -2210,7 +2225,8 @@ async function procesarRespuestaAsistencia(t, asiste) {
         if (t.flujo === 'n2') {
             await cancelarTurno(t.id, { porCliente: true, silencioso: true });
             await enviarACliente(t.telefono, 'Muy bien. Cancelamos la reunión y más adelante nos comunicaremos con usted. Quedamos a su disposición. ¡Que tenga un buen día!');
-            await enviarAAdmin(`📌 ${quien} no puede asistir el ${etiquetaTurno(t.inicio)} (#${t.id}) y pidió que lo contactemos más adelante. Cancelé la reunión.`);
+            await iniciarSeguimiento(await obtenerTurno(t.id) || t, 'mas_adelante');
+            await enviarAAdmin(`📌 ${quien} no puede asistir el ${etiquetaTurno(t.inicio)} (#${t.id}) y pidió que lo contactemos más adelante. Cancelé la reunión; en 2 días hábiles le escribo para retomar (y a los 7 y 15 días si no responde).`);
             return;
         }
         await registrarAsistencia(t);
@@ -2341,6 +2357,10 @@ async function contextoCliente(telefono) {
             : 'Esta persona es un PROSPECTO (todavía no contrató): aplicá el perfil comercial. Si ya tiene una reunión y quiere tratar otro tema, se suma a esa misma reunión.');
         const activos = await turnosActivosCliente(telefono);
         if (!activos.length) partes.push('No tiene ninguna reunión ni pedido vigente.');
+        const [seg] = await seguimientosActivos(telefono).catch(() => []);
+        if (seg?.ultimo_envio) partes.push(seg.motivo === 'no_asistio'
+            ? 'No pudo asistir a su última reunión y el Estudio le escribió para reprogramar: si quiere, ofrecele horarios con amabilidad, sin reprocharle nada.'
+            : 'Había pedido que lo contactemos más adelante y el Estudio le escribió para retomar: si quiere avanzar, ofrecele horarios.');
         for (const t of activos) {
             const c = leerCambio(t);
             const linkVisible = (t.recordatorios || {}).c15 === 'enviado' || Date.now() >= new Date(t.inicio).getTime() - 15 * 60000;
@@ -2965,6 +2985,10 @@ const HERRAMIENTAS_ADMIN = [
             nota: { type: 'STRING', description: 'Detalle breve que haya dado el administrador (opcional).' } }, required: ['resultado'] }
     },
     {
+        name: 'detener_seguimiento', description: 'Deja de mandarle los mensajes de seguimiento (días 2, 7 y 15) a una persona que no vino o pidió que la contactemos más adelante.',
+        parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono de la persona.' } }, required: ['cliente'] }
+    },
+    {
         name: 'reiniciar_contacto', description: 'SOLO PARA PRUEBAS: borra todo lo que el bot sabe de UNA persona (reuniones y sus eventos en Google Calendar, conversación, ficha) para que la trate como un contacto nuevo. No le avisa nada a la persona. Nunca para "todos".',
         parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono de la persona.' } }, required: ['cliente'] }
     },
@@ -3084,6 +3108,7 @@ async function ejecutarAccionAdmin(nombre, args) {
         case 'atender_consulta': return aceptarConsulta(args);
         case 'reiniciar_contacto': return reiniciarContacto(args);
         case 'resultado_negocio': return registrarResultado(args);
+        case 'detener_seguimiento': return detenerSeguimiento(args);
         case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
         case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
         case 'restablecer_dia': return restablecerDia(args.fecha);
@@ -3133,6 +3158,7 @@ async function instruccionesAdmin() {
         'Para una reunión NUEVA de un cliente (otro tema, o una consulta "⚖️ para evaluar" con día y hora) usá agendar_reunion: NUNCA muevas su reunión actual para eso. ' +
         'Para aceptar una consulta "⚖️ para evaluar" sin día ni hora ("decile que sí") usá atender_consulta; para no tomarla, no_atender_consulta. Identificá al cliente por el nombre o el teléfono que figura en el aviso: nunca lo confundas con otro cliente de la conversación.\n' +
         'SEGUIMIENTO (HubSpot): cuando te diga cómo siguió una persona usá resultado_negocio: "asistió" / "no vino" → asistio / no_asistio; "le mandé la propuesta" → propuesta_enviada; "contrató", "cerramos", "pagó" → ganado (además lo marca como cliente); "no siguió", "no le interesa", "lo perdimos" → perdido. Si la reunión tiene número, pasalo en turno_id.\n' +
+        'Si te dice "no le escribas más a X" (o que no le mandes más seguimientos), usá detener_seguimiento.\n' +
         'Si te pide reiniciar, resetear o borrar a una persona para probar ("que el bot crea que es nuevo"), usá reiniciar_contacto con ESA persona. Nunca reinicies a varias juntas ni a alguien que no nombró.\n' +
         'HORAS: usá solo una hora que haya dicho el administrador o el cliente (por ejemplo "a las 17:15"). Si dicen "después de la otra reunión" o algo sin hora, preguntá a qué hora, indicando a qué hora termina la reunión actual. Nunca elijas una hora por tu cuenta.\n' +
         'En los mensajes para clientes usá el mismo trato que el bot: "Estimado/a Sr./Sra. Apellido", de usted, en nombre del Estudio.\n' +
@@ -3292,6 +3318,126 @@ function textoRecordatorioAdmin(clave, t) {
         `${estado}\n🎥 ${t.meet}`;
 }
 
+// --- Seguimiento de los que no se presentan (o pidieron que los contactemos más adelante) ---
+// Días 2, 7 y 15. Sale solo, de lunes a viernes de 10 a 18 (sin feriados). Se corta si la persona responde,
+// pide una reunión, o si el administrador dice "no le escribas más".
+
+const DIAS_SEGUIMIENTO = [2, 7, 15];
+let respetarHorarioSeguimiento = true; // (las pruebas lo apagan para no depender de la hora)
+
+// Primer momento hábil (lunes a viernes, 10 a 18 hs, sin feriados) a partir de una fecha.
+function proximoMomentoHabil(fecha) {
+    let d = new Date(fecha);
+    for (let i = 0; i < 15; i++) {
+        const p = partesBA(d);
+        const habil = p.dow >= 1 && p.dow <= 5 && !nombreFeriado(p.fecha);
+        if (habil && p.hora >= '10:00' && p.hora < '18:00') return d;
+        if (habil && p.hora < '10:00') return desdeBA(p.fecha, '10:00');
+        d = desdeBA(partesBA(new Date(desdeBA(p.fecha, '12:00').getTime() + 24 * 3600000)).fecha, '10:00');
+    }
+    return d;
+}
+
+function temaDeTurno(t) {
+    const p = t?.producto || '';
+    if (['SAS', 'SRL', 'SA'].includes(p)) return `la constitución de su ${p}`;
+    if (p === 'Asociación Civil / ONG') return 'la constitución de su Asociación Civil';
+    if (p && p !== 'Otra consulta') return `su consulta de ${p.replace(/^Otro tema:\s*/i, '')}`;
+    return 'su consulta';
+}
+
+async function iniciarSeguimiento(t, motivo) {
+    try {
+        await db.query(`UPDATE seguimientos SET estado = 'reemplazado' WHERE telefono = $1 AND estado = 'activo'`, [t.telefono]);
+        const proximo = proximoMomentoHabil(new Date(Date.now() + DIAS_SEGUIMIENTO[0] * 24 * 3600000));
+        await db.query(`INSERT INTO seguimientos (telefono, turno_id, negocio_id, motivo, proximo) VALUES ($1, $2, $3, $4, $5)`,
+            [t.telefono, t.id, t.negocio_id || null, motivo, proximo]);
+    } catch (e) { console.error('Seguimiento (inicio):', e.message); }
+}
+
+async function detenerSeguimiento({ cliente }) {
+    const c = await buscarContacto(cliente);
+    if (c.error) return { ok: false, mensaje: c.error };
+    const { rowCount } = await db.query(`UPDATE seguimientos SET estado = 'detenido' WHERE telefono = $1 AND estado = 'activo'`, [c.telefono]);
+    return { ok: true, mensaje: rowCount ? `Listo, no le escribo más a ${etiquetaContacto(c)}.` : `${etiquetaContacto(c)} no tenía ningún seguimiento en curso.` };
+}
+
+function textoSeguimiento(paso, s, t, c, opciones) {
+    const ap = c?.nombre && !/^no (indicado|detectado)$/i.test(c.nombre) ? c.nombre.trim().split(/\s+/).slice(-1)[0] : null;
+    const saludo = ap ? `Hola, ${c.nombre.split(/\s+/)[0]}` : 'Hola';
+    const tema = temaDeTurno(t);
+    if (paso === 0) {
+        const inicio = s.motivo === 'no_asistio'
+            ? `${saludo}. Lamentamos no habernos podido reunir el ${t ? etiquetaTurno(t.inicio) : 'día acordado'}. Si todavía le interesa avanzar con ${tema}, con gusto reprogramamos la reunión sin cargo por Google Meet.`
+            : `${saludo}. Como nos pidió, le escribimos para retomar ${tema}. Si le parece, coordinamos una reunión sin cargo por Google Meet con un asesor del Estudio.`;
+        return opciones?.length
+            ? `${inicio} Le propongo:\n\n${textoOpciones(opciones)}\n\nIndíquenos el número de su preferencia, o díganos qué día y hora le queda mejor.`
+            : `${inicio} Díganos qué día y hora le queda bien y lo coordinamos.`;
+    }
+    if (paso === 1) {
+        const beneficio = ['SAS', 'SRL', 'SA', 'Asociación Civil / ONG'].includes(t?.producto)
+            ? 'La primera reunión es sin cargo, por Google Meet, y una vez que avanzamos presentamos la documentación en un máximo de 48 horas hábiles, con el Formulario 185 y el alta en ARCA incluidos.'
+            : 'La primera reunión es sin cargo, por Google Meet, y la atiende un asesor del Estudio especializado en su tema.';
+        return `${saludo}. Le escribimos para recordarle que seguimos a su disposición para ${tema}. ${beneficio}\n\nSi quiere coordinar, respóndanos por acá y le ofrecemos horarios.`;
+    }
+    return `${saludo}. No queremos insistir, así que este es nuestro último mensaje sobre ${tema}. Quedamos a su disposición: cuando lo necesite, escríbanos por acá y lo ayudamos con gusto.`;
+}
+
+async function revisarSeguimientos() {
+    const { rows } = await db.query(`SELECT * FROM seguimientos WHERE estado = 'activo' AND proximo <= NOW() ORDER BY proximo LIMIT 20`);
+    for (const s of rows) {
+        // ¿Respondió, pidió una reunión, o el negocio ya se cerró? Entonces se corta.
+        const { rows: [msj] } = await db.query(`SELECT COUNT(*)::int AS n FROM mensajes WHERE telefono = $1 AND rol = 'cliente' AND timestamp > $2`, [s.telefono, s.ultimo_envio || s.creado]);
+        const vigentes = await turnosActivosCliente(s.telefono);
+        const negocio = s.negocio_id ? await obtenerNegocio(s.negocio_id) : null;
+        if (msj.n || vigentes.length || negocio?.cerrado) {
+            await db.query(`UPDATE seguimientos SET estado = $2 WHERE id = $1`, [s.id, msj.n ? 'respondio' : vigentes.length ? 'reagendo' : 'cerrado']);
+            continue;
+        }
+        if (respetarHorarioSeguimiento && proximoMomentoHabil(new Date()) > new Date()) { // fuera de horario: se corre al próximo momento hábil
+            await db.query(`UPDATE seguimientos SET proximo = $2 WHERE id = $1`, [s.id, proximoMomentoHabil(new Date())]);
+            continue;
+        }
+        const t = s.turno_id ? await obtenerTurno(s.turno_id) : null;
+        const c = await obtenerContacto(s.telefono);
+        const paso = s.paso;
+        let opciones = null;
+        if (paso === 0) {
+            const libres = await horariosLibres({ tipo: 'consulta' }).catch(() => null);
+            opciones = libres ? elegirOpciones(libres, 'consulta') : null;
+            if (opciones?.length) {
+                await guardarOpcionesOfrecidas(s.telefono, opciones, 'consulta');
+                if (t) await recordarConsultaDeTurno(t);
+            }
+        }
+        try {
+            await enviarACliente(s.telefono, textoSeguimiento(paso, s, t, c, opciones));
+        } catch (e) {
+            console.error('Seguimiento (envío):', e.message);
+            continue; // se reintenta en la próxima vuelta
+        }
+        const quien = etiquetaContacto(c || t || {}, 'el cliente');
+        const siguiente = paso + 1;
+        if (siguiente < DIAS_SEGUIMIENTO.length) {
+            const base = new Date(s.creado).getTime();
+            const proximo = proximoMomentoHabil(new Date(Math.max(base + DIAS_SEGUIMIENTO[siguiente] * 24 * 3600000, Date.now() + 24 * 3600000)));
+            await db.query(`UPDATE seguimientos SET paso = $2, ultimo_envio = NOW(), proximo = $3 WHERE id = $1`, [s.id, siguiente, proximo]);
+            await enviarAAdmin(`📨 Seguimiento (día ${DIAS_SEGUIMIENTO[paso]}) enviado a ${quien}${paso === 0 ? ' · le ofrecí reprogramar' : ''}. Si querés que no le escriba más, decime "no le escribas más a ${c?.nombre || 'esa persona'}".`, { anotar: true });
+        } else {
+            await db.query(`UPDATE seguimientos SET paso = $2, ultimo_envio = NOW(), estado = 'terminado' WHERE id = $1`, [s.id, siguiente]);
+            if (negocio && !negocio.cerrado) await actualizarNegocio(negocio.id, { etapa: 'Perdido' }, 'Sin respuesta al seguimiento de 15 días');
+            await enviarAAdmin(`📨 Último seguimiento (día 15) enviado a ${quien}. No respondió en 15 días${negocio ? ', así que el negocio pasó a *Perdido*' : ''}. Si vuelve a escribir, se abre una consulta nueva.`, { anotar: true });
+        }
+    }
+}
+
+async function seguimientosActivos(telefono = null) {
+    const { rows } = telefono
+        ? await db.query(`SELECT * FROM seguimientos WHERE estado = 'activo' AND telefono = $1`, [telefono])
+        : await db.query(`SELECT * FROM seguimientos WHERE estado = 'activo'`);
+    return rows;
+}
+
 let revisandoTareas = false;
 let revisandoDesde = 0;
 let ultimaVueltaTareas = 0;
@@ -3382,6 +3528,9 @@ async function revisarTareas() {
             const c = await obtenerContacto(t.telefono);
             await enviarAAdmin(`📋 Terminó la reunión #${t.id} con ${etiquetaContacto(c || t, t.nombre || 'el cliente')} (${t.producto || 'consulta'}, ${etiquetaTurno(t.inicio)}).\n\n¿Asistió? Respondé *asistió* o *no vino*. Después podés decirme "le mandé la propuesta", "contrató" o "no siguió".`, { anotar: true });
         }
+
+        // Seguimiento de los que no se presentaron o pidieron que los contactemos más adelante.
+        await revisarSeguimientos().catch(e => console.error('Seguimientos:', e.message));
 
         ultimaVueltaTareas = Date.now();
     } catch (e) {
@@ -3549,6 +3698,12 @@ async function registrarResultado({ cliente, turno_id, resultado, nota }) {
     }
     if (!t) { const { rows: [ult] } = await db.query(`SELECT * FROM turnos WHERE negocio_id = $1 ORDER BY inicio DESC LIMIT 1`, [g.id]); t = ult || null; }
     if (t && ['asistio', 'no_asistio'].includes(resultado)) await db.query('UPDATE turnos SET resultado = $2 WHERE id = $1', [t.id, resultado]);
+    let extraSeg = '';
+    if (t && resultado === 'no_asistio') {
+        await iniciarSeguimiento({ ...t, negocio_id: g.id }, 'no_asistio');
+        extraSeg = ' En 2 días hábiles le escribo para ofrecerle reprogramar (y a los 7 y 15 días si no responde).';
+    }
+    if (['asistio', 'propuesta_enviada', 'ganado', 'perdido'].includes(resultado)) await db.query(`UPDATE seguimientos SET estado = 'cerrado' WHERE telefono = $1 AND estado = 'activo'`, [telefono]);
     await actualizarNegocio(g.id, { etapa }, `${etapa}${nota ? `: ${nota}` : ''}`);
     let extra = '';
     if (resultado === 'ganado') {
@@ -3556,7 +3711,7 @@ async function registrarResultado({ cliente, turno_id, resultado, nota }) {
         extra = ' Además quedó marcado como ⭐ cliente.';
     }
     const c = await obtenerContacto(telefono);
-    return { ok: true, mensaje: `Listo, ${etiquetaContacto(c || {}, 'el cliente')}: "${g.titulo}" pasó a *${etapa}*.${extra}${HUBSPOT_TOKEN ? '' : ' (HubSpot todavía no está conectado: queda guardado y se envía cuando cargues HUBSPOT_TOKEN.)'}` };
+    return { ok: true, mensaje: `Listo, ${etiquetaContacto(c || {}, 'el cliente')}: "${g.titulo}" pasó a *${etapa}*.${extra}${extraSeg}${HUBSPOT_TOKEN ? '' : ' (HubSpot todavía no está conectado: queda guardado y se envía cuando cargues HUBSPOT_TOKEN.)'}` };
 }
 
 // Reuniones que ya terminaron y esperan que digas si la persona asistió.
@@ -3797,7 +3952,7 @@ function esAdmin(msg) {
 
 function formatoFecha(fecha) {
     if (!fecha) return 'sin datos';
-    return new Date(fecha).toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' });
+    return new Date(fecha).toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', hourCycle: 'h23' });
 }
 
 async function estadoSistema() {
@@ -3830,6 +3985,8 @@ async function estadoSistema() {
         lineas.push(`📅 Google Calendar: ${ok ? `✅ conectado (${await leerConfig('google_cuenta')})` : '❌ el permiso falló, volvé a conectar'}`);
     }
     lineas.push(await estadoHubspot().catch(e => `🧲 HubSpot: ❌ ${e.message}`));
+    const { rows: [sg] } = await db.query(`SELECT COUNT(*)::int AS n FROM seguimientos WHERE estado = 'activo'`).catch(() => ({ rows: [{ n: 0 }] }));
+    lineas.push(`📨 Seguimientos en curso (no vinieron / contactar más adelante): ${sg.n}`);
     const haceMin = ultimaVueltaTareas ? Math.round((Date.now() - ultimaVueltaTareas) / 60000) : null;
     lineas.push(`⏰ Tareas programadas (recordatorios): ${haceMin === null ? '⏳ todavía no corrieron' : haceMin <= 3 ? `✅ última vuelta hace ${haceMin} min` : `❌ última vuelta hace ${haceMin} min (deberían correr cada minuto)`}`);
     lineas.push(`📋 Reglas de administrador: ${globalAdminRules.length}`);
@@ -4025,12 +4182,12 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
     // base
     inicializarDB, guardarConfig, db,
     _historialAdmin: () => historialAdmin,
-    _set: (k, v) => { if (k === 'socket') socketActual = v; if (k === 'conectado') isConnected = v; if (k === 'dbOk') dbOk = v; }
+    _set: (k, v) => { if (k === 'socket') socketActual = v; if (k === 'conectado') isConnected = v; if (k === 'dbOk') dbOk = v; if (k === 'horarioSeguimiento') respetarHorarioSeguimiento = v; }
 };
