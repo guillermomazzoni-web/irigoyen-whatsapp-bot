@@ -231,6 +231,7 @@ async function inicializarDB() {
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_sincronizado BOOLEAN DEFAULT FALSE`);
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_borrado BOOLEAN DEFAULT FALSE`);
         await db.query(`ALTER TABLE negocios ADD COLUMN IF NOT EXISTS borrado_hubspot BOOLEAN DEFAULT FALSE`);
+        await db.query(`CREATE TABLE IF NOT EXISTS eventos_negocio (id SERIAL PRIMARY KEY, negocio_id INTEGER, telefono TEXT, etapa TEXT, creado TIMESTAMPTZ DEFAULT NOW())`);
         await db.query(`
             CREATE TABLE IF NOT EXISTS seguimientos (
                 id SERIAL PRIMARY KEY,
@@ -1499,6 +1500,7 @@ async function reiniciarContacto({ cliente }) {
     await db.query('DELETE FROM mensajes WHERE telefono = $1', [tel]);
     await db.query('DELETE FROM negocios WHERE telefono = $1', [tel]);
     await db.query('DELETE FROM seguimientos WHERE telefono = $1', [tel]);
+    await db.query('DELETE FROM eventos_negocio WHERE telefono = $1', [tel]);
     await db.query(`DELETE FROM configuracion WHERE right(clave, length($1) + 1) = ':' || $1`, [tel]);
     await db.query('DELETE FROM contactos WHERE telefono = $1', [tel]);
     userHistories.delete(tel);
@@ -3438,6 +3440,99 @@ async function seguimientosActivos(telefono = null) {
     return rows;
 }
 
+// --- Informe semanal (lunes a las 9:00, o cuando pidas "ADMIN INFORME") ---
+
+function sumarDias(fecha, n) {
+    return partesBA(new Date(desdeBA(fecha, '12:00').getTime() + n * 24 * 3600000)).fecha;
+}
+function lunesDe(fecha) {
+    const dow = partesBA(desdeBA(fecha, '12:00')).dow;
+    return sumarDias(fecha, -((dow + 6) % 7));
+}
+const fechaDM = f => `${f.slice(8, 10)}/${f.slice(5, 7)}`;
+const pct = (a, b) => b ? `${Math.round(100 * a / b)}%` : '—';
+
+async function informeSemanal(ahora = new Date()) {
+    const hoy = partesBA(ahora).fecha;
+    const lunesPasado = sumarDias(lunesDe(hoy), -7);
+    const desde = desdeBA(lunesPasado, '00:00'), hasta = desdeBA(lunesDe(hoy), '00:00');
+    const r = [desde, hasta];
+    const q = async (sql, params = r) => (await db.query(sql, params)).rows;
+
+    const consultas = await q(`SELECT * FROM negocios WHERE creado_en >= $1 AND creado_en < $2`);
+    const porEsp = {};
+    for (const g of consultas) {
+        const e = String(g.especialidad || 'Sin definir').startsWith('Otro tema') ? 'Otros temas' : (g.especialidad || 'Sin definir');
+        porEsp[e] = (porEsp[e] || 0) + 1;
+    }
+    const interes = { alto: 0, medio: 0, bajo: 0 };
+    for (const g of consultas) if (interes[g.interes] !== undefined) interes[g.interes]++;
+    const otros = consultas.filter(g => String(g.titulo || '').startsWith('Otro tema'));
+    const otrosNo = otros.filter(g => g.etapa === 'Perdido').length;
+    const conReunion = (await q(`SELECT COUNT(DISTINCT negocio_id)::int AS n FROM turnos WHERE negocio_id = ANY($1)`, [consultas.map(g => g.id)]))[0].n;
+
+    const [t] = await q(`SELECT
+        COUNT(*) FILTER (WHERE creado_en >= $1 AND creado_en < $2)::int AS pedidas,
+        COUNT(*) FILTER (WHERE estado = 'confirmado' AND inicio >= $1 AND inicio < $2 AND inicio < NOW())::int AS realizadas,
+        COUNT(*) FILTER (WHERE estado = 'confirmado' AND inicio >= $1 AND inicio < $2 AND resultado = 'asistio')::int AS asistieron,
+        COUNT(*) FILTER (WHERE estado = 'confirmado' AND inicio >= $1 AND inicio < $2 AND resultado = 'no_asistio')::int AS no_vinieron,
+        COUNT(*) FILTER (WHERE estado IN ('cancelado', 'cancelado_cliente') AND actualizado_en >= $1 AND actualizado_en < $2)::int AS canceladas
+        FROM turnos`);
+    const ev = {};
+    for (const e of await q(`SELECT etapa, COUNT(*)::int AS n FROM eventos_negocio WHERE creado >= $1 AND creado < $2 GROUP BY etapa`)) ev[e.etapa] = e.n;
+
+    const L = [`📊 *Informe semanal* · semana del ${fechaDM(lunesPasado)} al ${fechaDM(sumarDias(lunesPasado, 4))}`, ''];
+    const sinMovimiento = !consultas.length && !t.pedidas && !t.realizadas && !t.canceladas && !Object.keys(ev).length;
+    L.push('*La semana pasada*');
+    if (sinMovimiento) L.push('Sin movimiento: no hubo consultas nuevas ni reuniones.');
+    else {
+        L.push(`💬 Consultas nuevas: ${consultas.length}${Object.keys(porEsp).length ? ` (${Object.entries(porEsp).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(', ')})` : ''}`);
+        if (consultas.length) L.push(`🔥 Interés: alto ${interes.alto} · medio ${interes.medio} · bajo ${interes.bajo}`);
+        L.push(`📅 Reuniones: ${t.pedidas} pedidas · ${t.realizadas} realizadas (✅ ${t.asistieron} asistieron, 🚫 ${t.no_vinieron} no vinieron) · ${t.canceladas} canceladas`);
+        L.push(`📄 Propuestas enviadas: ${ev['Propuesta enviada'] || 0} · 🏆 Ganados: ${ev['Ganado'] || 0} · ❌ Perdidos: ${ev['Perdido'] || 0}`);
+        if (otros.length) L.push(`⚖️ Otros temas: ${otros.length} (${otros.length - otrosNo} en curso o atendidas, ${otrosNo} no las tomamos)`);
+        L.push(`📈 Conversión: consulta → reunión ${pct(conReunion, consultas.length)} · reunión → ganado ${pct(ev['Ganado'] || 0, t.asistieron)}`);
+    }
+
+    L.push('', '*Próximos 7 días*');
+    const agenda = await q(`SELECT * FROM turnos WHERE estado = 'confirmado' AND inicio > NOW() AND inicio < NOW() + INTERVAL '7 days' ORDER BY inicio`, []);
+    if (!agenda.length) L.push('🗓️ No hay reuniones confirmadas.');
+    else {
+        let dia = null;
+        for (const x of agenda) {
+            const f = partesBA(x.inicio).fecha;
+            if (f !== dia) { dia = f; L.push(`🗓️ *${etiquetaFecha(desdeBA(f, '12:00'))}*`); }
+            L.push(`   • ${partesBA(x.inicio).hora} ${x.nombre || 'Cliente'} · ${x.producto || 'Consulta'} (#${x.id})`);
+        }
+    }
+    const pend = await turnosPendientesAdmin();
+    if (pend.length) L.push(`⏳ Esperando tu aprobación: ${pend.length}`, ...pend.map(x => `   • ${descripcionTurno(x)}`));
+    const segs = await q(`SELECT s.*, c.nombre FROM seguimientos s LEFT JOIN contactos c ON c.telefono = s.telefono WHERE s.estado = 'activo' AND s.proximo < NOW() + INTERVAL '7 days' ORDER BY s.proximo`, []);
+    if (segs.length) L.push(`📨 Seguimientos que salen: ${segs.length}`, ...segs.map(s => `   • ${s.nombre || 'Contacto'} · día ${DIAS_SEGUIMIENTO[s.paso] || '?'} · ${etiquetaFecha(s.proximo)}`));
+
+    const viejas = await q(`SELECT * FROM negocios WHERE etapa = 'Propuesta enviada' AND NOT cerrado AND actualizado_en < NOW() - INTERVAL '7 days' ORDER BY actualizado_en`, []);
+    const sinDato = await q(`SELECT * FROM turnos WHERE estado = 'confirmado' AND resultado IS NULL AND fin < NOW() AND fin > NOW() - INTERVAL '30 days' ORDER BY inicio`, []);
+    if (viejas.length || sinDato.length) {
+        L.push('', '*Necesita tu atención*');
+        for (const g of viejas) {
+            const c = await obtenerContacto(g.telefono);
+            L.push(`📄 ${etiquetaContacto(c || {}, 'Contacto')} · ${g.titulo}: propuesta enviada hace ${Math.floor((Date.now() - new Date(g.actualizado_en)) / 86400000)} días sin novedad`);
+        }
+        for (const x of sinDato) L.push(`❓ ¿${x.nombre || 'El cliente'} asistió a la reunión del ${etiquetaTurno(x.inicio)} (#${x.id})? Respondeme "asistió" o "no vino".`);
+    }
+    return L.join('\n');
+}
+
+async function revisarInformeSemanal(ahora = new Date()) {
+    const p = partesBA(ahora);
+    if (p.dow !== 1 || p.hora < '09:00') return;
+    const clave = `informe_semanal:${p.fecha}`;
+    if (await leerConfig(clave)) return;
+    await guardarConfig(clave, 'enviado');
+    await enviarAAdmin(await informeSemanal(ahora), { anotar: true });
+    return true;
+}
+
 let revisandoTareas = false;
 let revisandoDesde = 0;
 let ultimaVueltaTareas = 0;
@@ -3531,6 +3626,8 @@ async function revisarTareas() {
 
         // Seguimiento de los que no se presentaron o pidieron que los contactemos más adelante.
         await revisarSeguimientos().catch(e => console.error('Seguimientos:', e.message));
+        // Informe semanal: lunes a las 9.
+        await revisarInformeSemanal().catch(e => console.error('Informe semanal:', e.message));
 
         ultimaVueltaTareas = Date.now();
     } catch (e) {
@@ -3617,6 +3714,9 @@ async function actualizarNegocio(id, campos = {}, nota = null) {
     if (!g) return null;
     if (nota) campos.historial = `${g.historial ? g.historial + '\n' : ''}${fechaCorta()} · ${nota}`.slice(-5000);
     if (campos.etapa) campos.cerrado = ['Ganado', 'Perdido'].includes(campos.etapa);
+    if (campos.etapa && campos.etapa !== g.etapa) {
+        await db.query('INSERT INTO eventos_negocio (negocio_id, telefono, etapa) VALUES ($1, $2, $3)', [id, g.telefono, campos.etapa]).catch(() => {});
+    }
     const claves = Object.keys(campos);
     const sets = claves.map((k, i) => `${k} = $${i + 2}`).join(', ');
     await db.query(`UPDATE negocios SET ${sets}${sets ? ', ' : ''}sincronizado = FALSE, actualizado_en = NOW() WHERE id = $1`, [id, ...claves.map(k => campos[k])]);
@@ -3921,7 +4021,7 @@ async function estadoHubspot() {
 // ==================== 13. Comandos de respaldo ====================
 // Funcionan aunque Gemini esté saturado.
 
-const REGEX_COMANDO_ADMIN = /^ADMIN\s+(ESTADO|MODELOS|CONECTAR\s+GOOGLE|AGENDA|AYUDA|HUBSPOT)$/i;
+const REGEX_COMANDO_ADMIN = /^ADMIN\s+(ESTADO|MODELOS|CONECTAR\s+GOOGLE|AGENDA|AYUDA|HUBSPOT|INFORME)$/i;
 
 // Lista los modelos de Gemini que acepta esta clave, para elegir el de respaldo.
 function listarModelos() {
@@ -4003,6 +4103,11 @@ async function procesarComandoAdmin(sock, sender, text) {
         return;
     }
 
+    if (/^ADMIN\s+INFORME$/i.test(comando)) {
+        await sock.sendMessage(sender, { text: await informeSemanal() });
+        return;
+    }
+
     if (/^ADMIN\s+HUBSPOT$/i.test(comando)) {
         await sock.sendMessage(sender, { text: await informeHubspot() });
         return;
@@ -4016,7 +4121,8 @@ async function procesarComandoAdmin(sock, sender, text) {
             '• ADMIN MODELOS: modelos de Gemini disponibles\n' +
             '• ADMIN CONECTAR GOOGLE: link para conectar Google Calendar\n' +
             '• ADMIN AGENDA: reuniones de los próximos 7 días, con su número\n' +
-            '• ADMIN HUBSPOT: envía ya lo pendiente a HubSpot y te dice qué pasó'
+            '• ADMIN HUBSPOT: envía ya lo pendiente a HubSpot y te dice qué pasó\n' +
+            '• ADMIN INFORME: el informe semanal (llega solo los lunes a las 9)'
         });
         return;
     }
@@ -4182,7 +4288,7 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
