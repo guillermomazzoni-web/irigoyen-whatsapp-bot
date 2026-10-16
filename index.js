@@ -256,6 +256,8 @@ async function inicializarDB() {
             );
         `);
         await db.query(`ALTER TABLE negocios ADD COLUMN IF NOT EXISTS monto_usd NUMERIC`);
+        await db.query(`ALTER TABLE presupuestos ADD COLUMN IF NOT EXISTS token_formulario TEXT`);
+        await db.query(`ALTER TABLE presupuestos ADD COLUMN IF NOT EXISTS formulario_completado_en TIMESTAMPTZ`);
         await db.query(`CREATE TABLE IF NOT EXISTS eventos_negocio (id SERIAL PRIMARY KEY, negocio_id INTEGER, telefono TEXT, etapa TEXT, creado TIMESTAMPTZ DEFAULT NOW())`);
         await db.query(`
             CREATE TABLE IF NOT EXISTS seguimientos (
@@ -1890,13 +1892,130 @@ async function registrarPago({ cliente }) {
     if (c.error) return { ok: false, mensaje: c.error };
     const { rows: [p] } = await db.query(`SELECT * FROM presupuestos WHERE telefono = $1 AND estado = 'enviado' ORDER BY id DESC LIMIT 1`, [c.telefono]);
     if (!p) return { ok: false, mensaje: `No encuentro ningún presupuesto enviado a ${etiquetaContacto(c)}. Si igual contrató, decime "${c.nombre || 'X'} contrató".` };
-    await enviarACliente(c.telefono, 'Muchas gracias por su confianza. Recibimos la confirmación del pago. 🙌\n\n' + TEXTO_FORMULARIO_SAS);
+    const link = await linkFormularioSAS(p, c);
+    await enviarACliente(c.telefono, link
+        ? 'Muchas gracias por su confianza. Recibimos la confirmación del pago. 🙌\n\n' +
+          `Para iniciar la constitución de su SAS, complete este formulario con los datos de la sociedad, los socios y los administradores:\n👉 ${link}\n\n` +
+          'Le lleva unos 10 minutos. Al terminar le llega una copia por correo y el asesor recibe la información para comenzar.\n\n' +
+          'Recuerde que la firma del instrumento se certifica ante escribano; el asesor le puede recomendar uno.'
+        : 'Muchas gracias por su confianza. Recibimos la confirmación del pago. 🙌\n\n' + TEXTO_FORMULARIO_SAS);
     await actualizarPresupuesto(p.id, { estado: 'pagado' });
     if (p.negocio_id) {
         await actualizarNegocio(p.negocio_id, { etapa: 'Ganado' }, `Pagó el presupuesto (${formatoPesos(p.total_ars || totalPesos(p))})`).catch(() => {});
     }
     await db.query('UPDATE contactos SET es_cliente = TRUE, hubspot_sincronizado = FALSE WHERE telefono = $1', [c.telefono]);
-    return { ok: true, mensaje: `Listo: ${etiquetaContacto(c)} quedó como ⭐ cliente, el negocio pasó a *Ganado* y le mandé el formulario de datos para que lo envíe a ${CORREO_DATOS_SAS}.` };
+    return { ok: true, mensaje: `Listo: ${etiquetaContacto(c)} quedó como ⭐ cliente, el negocio pasó a *Ganado* y le mandé el formulario de datos${link ? ' (Google Forms). Cuando lo complete te aviso.' : ` para que lo envíe a ${CORREO_DATOS_SAS}. (Tip: cargá el formulario online con "formulario sas: …").`}` };
+}
+
+
+// --- Formulario de datos (Google Forms) y datos bancarios ---
+
+// El link del formulario lo carga el administrador: "formulario sas: https://docs.google.com/forms/...".
+// El script de Google lo deja con REFERENCIA y NOMBRE de ejemplo, que acá se reemplazan por los del cliente.
+async function linkFormularioSAS(p, c) {
+    const base = await leerConfig('formulario_sas_url');
+    if (!base) return null;
+    let token = p.token_formulario;
+    if (!token) {
+        token = require('crypto').randomBytes(8).toString('hex');
+        await db.query('UPDATE presupuestos SET token_formulario = $2 WHERE id = $1', [p.id, token]);
+    }
+    const nombre = c?.nombre && !/^no (indicado|detectado)$/i.test(c.nombre) ? c.nombre : '';
+    return base.replace('REFERENCIA', encodeURIComponent(token)).replace('NOMBRE', encodeURIComponent(nombre));
+}
+
+// El script del formulario avisa acá cuando el cliente lo completó.
+async function formularioCompletado(token) {
+    const { rows: [p] } = await db.query('SELECT * FROM presupuestos WHERE token_formulario = $1', [String(token || '')]);
+    if (!p) return false;
+    if (p.formulario_completado_en) return true;
+    await db.query('UPDATE presupuestos SET formulario_completado_en = NOW() WHERE id = $1', [p.id]);
+    const c = await obtenerContacto(p.telefono);
+    await enviarAAdmin(`📋 ${etiquetaContacto(c || {}, 'El cliente')} completó el formulario de datos de la SAS. Los datos llegaron a ${CORREO_DATOS_SAS}.`, { anotar: true });
+    await enviarACliente(p.telefono, '¡Muchas gracias! Recibimos sus datos. El asesor los revisa y le avisa por este medio cómo seguimos con la constitución de su SAS.').catch(() => {});
+    if (p.negocio_id) await actualizarNegocio(p.negocio_id, {}, 'Completó el formulario de datos de la SAS').catch(() => {});
+    return true;
+}
+
+// Datos bancarios: el cliente los pide y el administrador confirma cuáles se envían.
+async function pedirDatosBancarios(telefono) {
+    const c = await obtenerContacto(telefono);
+    const datos = await leerConfig('datos_bancarios');
+    const { rows: [p] } = await db.query(`SELECT * FROM presupuestos WHERE telefono = $1 AND estado = 'enviado' ORDER BY id DESC LIMIT 1`, [telefono]);
+    await guardarConfig('banco_pendiente', JSON.stringify({ telefono, presupuesto_id: p?.id || null, creada: Date.now() }));
+    await enviarAAdmin(`💳 ${etiquetaContacto(c || {}, 'Un cliente')} pide los datos para transferir${p ? ` (presupuesto ${p.concepto}: ${formatoPesos(p.total_ars || totalPesos(p))})` : ''}.\n\n` +
+        (datos ? `¿Le envío estos?\n\n${datos}\n\nRespondé *sí*, *no*, o pasame otros datos (con CBU, CVU o alias) y le mando esos.`
+            : 'Todavía no tengo datos bancarios cargados. Pasame los datos (con CBU, CVU o alias) y se los envío. Para guardarlos para la próxima: *datos bancarios: …*'), { anotar: true });
+}
+
+async function respuestaDatosBancarios(texto) {
+    const pend = await leerConfigJSON('banco_pendiente', 1);
+    if (!pend || Date.now() - pend.creada > 2 * 3600000) return null;
+    const t = normalizarTexto(texto);
+    let datos = null;
+    if (/^(si|sii|ok|dale|enviar|envialos|mandalos|si enviar|si envialos|confirmo|correcto)$/.test(t)) {
+        datos = await leerConfig('datos_bancarios');
+        if (!datos) return 'No tengo datos bancarios cargados: pasame los datos (con CBU, CVU o alias) y se los envío.';
+    } else if (/^(no|cancelar|cancela|no le envies|no le mandes)$/.test(t)) {
+        await borrarConfig('banco_pendiente');
+        return 'Listo, no le envío los datos bancarios. 👍';
+    } else if (/\b(cbu|cvu|alias)\b/i.test(texto)) {
+        datos = String(texto).trim();
+    } else return null;
+    const c = await obtenerContacto(pend.telefono);
+    let monto = '';
+    if (pend.presupuesto_id) {
+        const { rows: [p] } = await db.query('SELECT * FROM presupuestos WHERE id = $1', [pend.presupuesto_id]);
+        if (p) monto = ` (total ${formatoPesos(p.total_ars || totalPesos(p))})`;
+    }
+    try {
+        await enviarACliente(pend.telefono, `Le enviamos los datos para la transferencia${monto}:\n\n${datos}\n\nUna vez realizada, envíenos el comprobante por este medio. ¡Muchas gracias!`);
+    } catch (e) {
+        return `No pude enviarlos por WhatsApp (${e.message}). Probá de nuevo respondiendo *sí*.`;
+    }
+    await borrarConfig('banco_pendiente');
+    return `✅ Le envié los datos bancarios a ${etiquetaContacto(c || {}, 'el cliente')}. Cuando mande el comprobante te lo reenvío.`;
+}
+
+// Comandos que el administrador escribe tal cual (se guardan sin pasar por la IA).
+async function comandoConfiguracionAdmin(texto) {
+    const mForm = String(texto).match(/^\s*formulario\s+sas\s*:\s*(https?:\/\/\S+)/i);
+    if (mForm) {
+        const url = mForm[1];
+        if (!/docs\.google\.com\/forms|forms\.gle/.test(url)) return 'Ese link no parece de Google Forms. Pasame el que te dio el script ("formulario sas: https://docs.google.com/forms/...").';
+        await guardarConfig('formulario_sas_url', url);
+        return url.includes('REFERENCIA')
+            ? '✅ Guardé el formulario de la SAS. Cuando un cliente pague, le mando el link con su nombre y su código ya cargados.'
+            : '✅ Guardé el formulario. Ojo: ese link no tiene el código de referencia precargado, así que no voy a poder avisarte quién lo completó. Usá el link que muestra el script (el que tiene REFERENCIA).';
+    }
+    const mBanco = String(texto).match(/^\s*datos\s+bancarios\s*:\s*([\s\S]+)/i);
+    if (mBanco) {
+        const datos = mBanco[1].trim();
+        if (!/\b(cbu|cvu|alias)\b/i.test(datos)) return 'Para guardarlos necesito al menos el CBU, el CVU o el alias.';
+        await guardarConfig('datos_bancarios', datos);
+        return `✅ Guardé estos datos bancarios:\n\n${datos}\n\nAntes de mandárselos a un cliente siempre te pregunto si son estos u otros.`;
+    }
+    if (/^\s*(ver\s+)?datos\s+bancarios\s*\??\s*$/i.test(texto)) {
+        const datos = await leerConfig('datos_bancarios');
+        return datos ? `💳 Datos bancarios guardados:\n\n${datos}` : 'Todavía no hay datos bancarios cargados. Mandá: *datos bancarios: Banco … · Titular … · CUIT … · CBU … · Alias …*';
+    }
+    return null;
+}
+
+// El cliente manda un archivo o foto (posible comprobante) con un presupuesto enviado: te lo reenvía.
+async function procesarArchivoCliente(sock, msg, sender) {
+    const m = msg.message || {};
+    const archivo = m.imageMessage || m.documentMessage || m.documentWithCaptionMessage?.message?.documentMessage;
+    if (!archivo) return false;
+    const { rows: [p] } = await db.query(`SELECT * FROM presupuestos WHERE telefono = $1 AND estado = 'enviado' ORDER BY id DESC LIMIT 1`, [sender]);
+    if (!p) return false;
+    const c = await obtenerContacto(sender);
+    const jid = await obtenerJidAdmin(sock);
+    await enviarWhatsApp(sock, jid, { forward: msg }).catch(e => console.error('Reenvío de comprobante:', e.message));
+    await enviarAAdmin(`📎 ${etiquetaContacto(c || {}, 'El cliente')} envió un archivo (posible comprobante de la transferencia, presupuesto ${formatoPesos(p.total_ars || totalPesos(p))}). Te lo reenvié arriba. Si está todo bien, decime "${c?.nombre || 'X'} pagó".`, { anotar: true });
+    await enviarACliente(sender, 'Muchas gracias. Recibimos el archivo: el asesor verifica la transferencia y le confirma a la brevedad.').catch(() => {});
+    await guardarMensaje(sender, 'cliente', '[Envió un archivo: posible comprobante de pago]', numeroCliente(msg));
+    return true;
 }
 
 // ==================== 7. Bot de clientes ====================
@@ -1929,6 +2048,7 @@ function construirInstrucciones() {
         '5. Nunca prometas que lo va a atender un abogado: decí siempre "un asesor del Estudio".\n' +
         '6. PRECIOS: NUNCA escribas precios, montos, rangos ni estimaciones, aunque insistan. ' +
         'Si pide el precio o un presupuesto de una SAS, se lo preparamos: preguntá de a una (salteá lo que ya dijo) 1) si la sociedad va a estar en CABA, 2) cuántos socios van a ser, 3) si alguno de los socios es una empresa, 4) si alguno es extranjero y, en ese caso, si tiene CUIT o CUIL argentino, 5) si tiene una dirección en CABA para la sede (el Estudio no ofrece domicilio). Con eso usá preparar_presupuesto. ' +
+        'Si pide los datos para transferir o pagar, usá pedir_datos_bancarios (nunca escribas un CBU o alias). Si dice que ya pagó, pedile que envíe el comprobante por acá. ' +
         'Para otros trámites (SRL, SA, mantenimiento, etc.) explicá que el valor depende del caso y que en la reunión el asesor arma una propuesta a medida. Si pregunta por el mantenimiento o las actas después de constituir, decile que el Estudio ofrece tarifas especiales para la confección de actas, que cotiza el asesor.\n' +
         '7. Sé conciso: máximo 2 a 4 oraciones breves. Estás respondiendo por WhatsApp. Hacé UNA pregunta por mensaje.\n' +
         '8. Servicios del Estudio: constitución de sociedades, mantenimiento societario (balances, asambleas ordinarias y extraordinarias, cambio de autoridades y gerencias), transferencias y procesos de disolución y cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.\n' +
@@ -2041,6 +2161,11 @@ const HERRAMIENTAS_CLIENTE = [
             },
             required: ['tramite', 'caba', 'socios', 'socio_empresa', 'extranjero_sin_cuit', 'sede_caba']
         }
+    },
+    {
+        name: 'pedir_datos_bancarios',
+        description: 'El cliente pide los datos (CBU, alias) para transferir el pago. El asesor confirma cuáles se envían; vos NUNCA escribas datos bancarios.',
+        parameters: { type: 'OBJECT', properties: {} }
     },
     {
         name: 'cancelar_mi_turno',
@@ -2383,6 +2508,11 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             return { ok: true, _silencio: true };
         }
 
+        if (nombre === 'pedir_datos_bancarios') {
+            await pedirDatosBancarios(telefono);
+            return { ok: true, indicacion: 'Decile que en un momento le enviamos los datos para la transferencia por este medio. NO escribas ningún dato bancario.' };
+        }
+
         if (nombre === 'preparar_presupuesto') {
             if (args.tramite !== 'SAS') return { error: 'Por ahora el presupuesto automático es solo para SAS. Para este trámite ofrecé la reunión sin cargo.' };
             let ficha = contacto;
@@ -2719,6 +2849,12 @@ async function enviarIcs(req, res, token) {
     res.set('Content-Disposition', 'attachment; filename="reunion-estudio-irigoyen.ics"');
     res.send(ics);
 }
+
+// Aviso del formulario de Google: el cliente completó los datos de la SAS.
+app.get('/formulario-sas/:token', async (req, res) => {
+    try { await formularioCompletado(req.params.token); } catch (e) { console.error('Formulario SAS:', e.message); }
+    res.send('ok');
+});
 
 app.get('/agenda/:token', async (req, res) => {
     if (req.params.token.endsWith('.ics')) return enviarIcs(req, res, req.params.token.slice(0, -4));
@@ -3467,6 +3603,7 @@ async function instruccionesAdmin() {
         'Para una reunión NUEVA de un cliente (otro tema, o una consulta "⚖️ para evaluar" con día y hora) usá agendar_reunion: NUNCA muevas su reunión actual para eso. ' +
         'Para aceptar una consulta "⚖️ para evaluar" sin día ni hora ("decile que sí") usá atender_consulta; para no tomarla, no_atender_consulta. Identificá al cliente por el nombre o el teléfono que figura en el aviso: nunca lo confundas con otro cliente de la conversación.\n' +
         'SEGUIMIENTO (HubSpot): cuando te diga cómo siguió una persona usá resultado_negocio: "asistió" / "no vino" → asistio / no_asistio; "le mandé la propuesta" → propuesta_enviada; "contrató", "cerramos", "pagó" → ganado (además lo marca como cliente); "no siguió", "no le interesa", "lo perdimos" → perdido. Si la reunión tiene número, pasalo en turno_id.\n' +
+        'Para cargar datos el administrador escribe tal cual "datos bancarios: …" o "formulario sas: …" (eso lo guarda el sistema solo).\n' +
         'PRESUPUESTOS: "cotizale a X una SAS con N socios" → armar_presupuesto; "mandale el presupuesto a X" → retomar_presupuesto; "X pagó" → registrar_pago. El envío del presupuesto lo maneja el sistema con 3 confirmaciones: vos nunca digas que lo enviaste.\n' +
         'Si te dice "no le escribas más a X" (o que no le mandes más seguimientos), usá detener_seguimiento.\n' +
         'Si te pide reiniciar, resetear o borrar a una persona para probar ("que el bot crea que es nuevo"), usá reiniciar_contacto con ESA persona. Nunca reinicies a varias juntas ni a alguien que no nombró.\n' +
@@ -3501,9 +3638,17 @@ async function procesarMensajeAdmin(sock, sender, text) {
         recordarEnHistorialAdmin(text, t);
     };
 
+    // 0a) Comandos de configuración: "formulario sas: …", "datos bancarios: …".
+    const rConf = await comandoConfiguracionAdmin(text).catch(e => { console.error('Configuración:', e.message); return null; });
+    if (rConf) return responder(rConf);
+
     // 0) Presupuesto esperando tus 3 confirmaciones (o un cambio: "dólar 1460", "total $900.000").
     const rPresu = await respuestaPresupuesto(text).catch(e => { console.error('Presupuesto:', e.message); return null; });
     if (rPresu) return responder(rPresu);
+
+    // 0b) Un cliente pidió los datos bancarios: "sí" envía los guardados, o le pasás otros.
+    const rBanco = await respuestaDatosBancarios(text).catch(e => { console.error('Datos bancarios:', e.message); return null; });
+    if (rBanco) return responder(rBanco);
 
     // 1) Respuesta a una acción que quedó esperando confirmación.
     const pendiente = await leerAccionPendiente();
@@ -4398,6 +4543,7 @@ async function estadoSistema() {
         lineas.push(`📅 Google Calendar: ${ok ? `✅ conectado (${await leerConfig('google_cuenta')})` : '❌ el permiso falló, volvé a conectar'}`);
     }
     lineas.push(await estadoHubspot().catch(e => `🧲 HubSpot: ❌ ${e.message}`));
+    lineas.push(`💳 Datos bancarios: ${await leerConfig('datos_bancarios').catch(() => null) ? '✅ cargados' : '⚠️ sin cargar ("datos bancarios: …")'} · 📋 Formulario SAS: ${await leerConfig('formulario_sas_url').catch(() => null) ? '✅ cargado' : '⚠️ sin cargar'}`);
     const { rows: [sg] } = await db.query(`SELECT COUNT(*)::int AS n FROM seguimientos WHERE estado = 'activo'`).catch(() => ({ rows: [{ n: 0 }] }));
     lineas.push(`📨 Seguimientos en curso (no vinieron / contactar más adelante): ${sg.n}`);
     const haceMin = ultimaVueltaTareas ? Math.round((Date.now() - ultimaVueltaTareas) / 60000) : null;
@@ -4530,6 +4676,9 @@ async function connectToWhatsApp() {
                              msg.message.extendedTextMessage?.text ||
                              msg.message.imageMessage?.caption || '';
 
+                // Un archivo o foto de un cliente con presupuesto enviado (posible comprobante): se te reenvía.
+                if (!esAdmin(msg) && await procesarArchivoCliente(sock, msg, sender).catch(e => { console.error('Archivo:', e.message); return false; })) continue;
+
                 if (!text.trim()) continue;
 
                 const numero = numeroCliente(msg);
@@ -4601,7 +4750,7 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, formularioCompletado, procesarArchivoCliente, comandoConfiguracionAdmin, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
