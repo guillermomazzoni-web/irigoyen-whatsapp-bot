@@ -1732,10 +1732,7 @@ function totalPesos(p) {
 function textoPresupuestoCliente(p, c) {
     const nombre = c?.nombre && !/^no (indicado|detectado)$/i.test(c.nombre) ? c.nombre : null;
     const ars = totalPesos(p);
-    const fecha = partesBA(p.creado || new Date()).fecha;
-    const equivalente = p.total_usd != null && p.tipo_cambio && !p.total_ars_manual
-        ? `\n_Equivalente a ${formatoUSD(p.total_usd)} al dólar oficial BNA vendedor del ${fecha.slice(8, 10)}/${fecha.slice(5, 7)}/${fecha.slice(0, 4)}. Válido por 15 días._`
-        : '\n_Válido por 15 días._';
+    const equivalente = '\n_Válido por 15 días._'; // al cliente se le cotiza siempre en pesos
     return `📄 *Presupuesto · Estudio Jaime Irigoyen*\n\n${nombre ? `Estimado/a ${nombre}:` : 'Estimado/a:'}\n\n` +
         `Le enviamos el presupuesto para la *constitución de su SAS en la Ciudad Autónoma de Buenos Aires*:\n\n` +
         `*${p.concepto}: ${ars != null ? formatoPesos(ars) : '(a cotizar)'}* (IVA incluido)${equivalente}\n\n` +
@@ -1793,7 +1790,7 @@ async function textoConfirmacion1(p) {
     if (p.a_cotizar || p.sin_sede) lineas.push('');
     lineas.push('— Así le llegaría —', '', textoPresupuestoCliente(p, c), '');
     if (p.total_ars_manual) lineas.push(`Total fijado por vos: ${formatoPesos(p.total_ars_manual)}.`);
-    else if (p.tipo_cambio) lineas.push(`💵 Dólar oficial BNA vendedor usado: ${formatoPesos(p.tipo_cambio)}${p.fuente_cambio ? ` (fuente: ${p.fuente_cambio})` : ''}. Si no coincide con el del BNA, decime *dólar 1460* y lo recalculo.`);
+    else if (p.tipo_cambio) lineas.push(`💵 ${p.total_usd != null ? `${formatoUSD(p.total_usd)} × ` : ''}dólar oficial BNA vendedor ${formatoPesos(p.tipo_cambio)}${p.fuente_cambio ? ` (fuente: ${p.fuente_cambio})` : ''}. Si no coincide con el del BNA, decime *dólar 1460* y lo recalculo.`);
     else lineas.push('💵 No pude obtener el dólar oficial de hoy: decime el valor, por ejemplo *dólar 1460*.');
     if (ars == null) {
         lineas.push('', p.total_usd == null ? 'Falta el total: decime *total 900 dólares* o *total $1.200.000*.' : 'Falta el dólar del día para calcular el total en pesos.');
