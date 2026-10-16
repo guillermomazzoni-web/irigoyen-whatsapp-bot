@@ -9,6 +9,7 @@
  *   4. Fechas, horario de atención y feriados
  *   5. Disponibilidad (qué horarios están libres)
  *   6. Turnos: una reunión = un número; los cambios de horario quedan dentro de la misma reunión
+ *   6b. Cotizador: presupuestos (SAS) con 3 confirmaciones del administrador
  *   7. Bot de clientes: instrucciones, herramientas y respuestas directas
  *   8. Páginas web (QR y "agregar a mi agenda")
  *   9. Gemini (llamadas, reintentos y herramientas)
@@ -231,6 +232,30 @@ async function inicializarDB() {
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_sincronizado BOOLEAN DEFAULT FALSE`);
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS hubspot_borrado BOOLEAN DEFAULT FALSE`);
         await db.query(`ALTER TABLE negocios ADD COLUMN IF NOT EXISTS borrado_hubspot BOOLEAN DEFAULT FALSE`);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS presupuestos (
+                id SERIAL PRIMARY KEY,
+                telefono TEXT NOT NULL,
+                negocio_id INTEGER,
+                tramite TEXT NOT NULL,
+                concepto TEXT,
+                socios INTEGER,
+                total_usd NUMERIC,
+                a_cotizar BOOLEAN DEFAULT FALSE,
+                motivos JSONB,
+                sin_sede BOOLEAN DEFAULT FALSE,
+                tipo_cambio NUMERIC,
+                fuente_cambio TEXT,
+                total_ars_manual NUMERIC,
+                total_ars NUMERIC,
+                estado TEXT NOT NULL DEFAULT 'borrador',
+                confirmaciones INTEGER DEFAULT 0,
+                enviado_en TIMESTAMPTZ,
+                creado TIMESTAMPTZ DEFAULT NOW(),
+                actualizado TIMESTAMPTZ DEFAULT NOW()
+            );
+        `);
+        await db.query(`ALTER TABLE negocios ADD COLUMN IF NOT EXISTS monto_usd NUMERIC`);
         await db.query(`CREATE TABLE IF NOT EXISTS eventos_negocio (id SERIAL PRIMARY KEY, negocio_id INTEGER, telefono TEXT, etapa TEXT, creado TIMESTAMPTZ DEFAULT NOW())`);
         await db.query(`
             CREATE TABLE IF NOT EXISTS seguimientos (
@@ -1501,6 +1526,7 @@ async function reiniciarContacto({ cliente }) {
     await db.query('DELETE FROM negocios WHERE telefono = $1', [tel]);
     await db.query('DELETE FROM seguimientos WHERE telefono = $1', [tel]);
     await db.query('DELETE FROM eventos_negocio WHERE telefono = $1', [tel]);
+    await db.query('DELETE FROM presupuestos WHERE telefono = $1', [tel]);
     await db.query(`DELETE FROM configuracion WHERE right(clave, length($1) + 1) = ':' || $1`, [tel]);
     await db.query('DELETE FROM contactos WHERE telefono = $1', [tel]);
     userHistories.delete(tel);
@@ -1653,6 +1679,229 @@ async function leerEsperandoRespuesta(telefono) {
     }
 }
 
+// ==================== 6b. Cotizador (presupuestos) ====================
+// El bot hace las preguntas, calcula con la tabla y arma el presupuesto. Nunca le da un número al cliente:
+// el presupuesto se envía solo después de 3 confirmaciones del administrador.
+
+const TARIFAS = {
+    SAS: { base_usd: 550, socios_incluidos: 2, socio_adicional_usd: 15 }
+};
+const CORREO_DATOS_SAS = 'sasdatos@jaimeirigoyen.com.ar';
+const VIGENCIA_CONFIRMACION_MIN = 30;
+
+const formatoPesos = n => '$ ' + Math.round(n).toLocaleString('es-AR');
+const formatoUSD = n => 'USD ' + Number(n).toLocaleString('es-AR', { maximumFractionDigits: 2 });
+
+// Dólar oficial (vendedor) del día. Se cachea por día; si no hay servicio, devuelve null y se le pide al administrador.
+let dolarDelDia = null; // { fecha, venta, fuente }
+async function obtenerDolarOficial() {
+    const hoy = partesBA(new Date()).fecha;
+    if (dolarDelDia?.fecha === hoy) return dolarDelDia;
+    const fuentes = [
+        ['dolarapi.com', 'https://dolarapi.com/v1/dolares/oficial', j => j?.venta],
+        ['argentinadatos.com', 'https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial', j => Array.isArray(j) ? j[j.length - 1]?.venta : j?.venta]
+    ];
+    for (const [fuente, url, leer] of fuentes) {
+        const r = await solicitudHttps('GET', url, { timeout: 10000 }).catch(() => null);
+        const venta = r?.status === 200 ? Number(leer(r.json)) : NaN;
+        if (venta > 0) { dolarDelDia = { fecha: hoy, venta, fuente }; return dolarDelDia; }
+    }
+    return null;
+}
+
+// Calcula el presupuesto. Si hay algo fuera de lo estándar, queda "a cotizar por el asesor".
+function calcularPresupuesto({ tramite = 'SAS', socios, caba = true, socio_empresa = false, extranjero_sin_cuit = false }) {
+    const t = TARIFAS[tramite];
+    const n = Math.max(1, Math.floor(Number(socios) || 0));
+    const motivos = [];
+    if (!caba) motivos.push('la sociedad no es en CABA');
+    if (socio_empresa) motivos.push('hay un socio que es una empresa');
+    if (extranjero_sin_cuit) motivos.push('hay un socio extranjero sin CUIT/CUIL argentino');
+    const concepto = `Constitución de ${tramite}${caba ? ' en CABA' : ''} · ${n} socio${n === 1 ? '' : 's'}`;
+    if (!t || motivos.length) return { concepto, socios: n, total_usd: null, a_cotizar: true, motivos };
+    const total_usd = t.base_usd + Math.max(0, n - t.socios_incluidos) * t.socio_adicional_usd;
+    return { concepto, socios: n, total_usd, a_cotizar: false, motivos };
+}
+
+function totalPesos(p) {
+    if (p.total_ars_manual) return Number(p.total_ars_manual);
+    if (p.total_usd == null || !p.tipo_cambio) return null;
+    return Math.round(Number(p.total_usd) * Number(p.tipo_cambio));
+}
+
+function textoPresupuestoCliente(p, c) {
+    const nombre = c?.nombre && !/^no (indicado|detectado)$/i.test(c.nombre) ? c.nombre : null;
+    const ars = totalPesos(p);
+    const fecha = partesBA(p.creado || new Date()).fecha;
+    const equivalente = p.total_usd != null && p.tipo_cambio && !p.total_ars_manual
+        ? `\n_Equivalente a ${formatoUSD(p.total_usd)} al dólar oficial BNA vendedor del ${fecha.slice(8, 10)}/${fecha.slice(5, 7)}/${fecha.slice(0, 4)}. Válido por 15 días._`
+        : '\n_Válido por 15 días._';
+    return `📄 *Presupuesto · Estudio Jaime Irigoyen*\n\n${nombre ? `Estimado/a ${nombre}:` : 'Estimado/a:'}\n\n` +
+        `Le enviamos el presupuesto para la *constitución de su SAS en la Ciudad Autónoma de Buenos Aires*:\n\n` +
+        `*${p.concepto}: ${ars != null ? formatoPesos(ars) : '(a cotizar)'}* (IVA incluido)${equivalente}\n\n` +
+        '*Incluye:* redacción del instrumento constitutivo, inscripción en IGJ con tasa y publicación en el Boletín Oficial, Formulario 185, alta de CUIT en ARCA y apertura de libros. Presentación en un máximo de 48 horas hábiles.\n\n' +
+        '*No incluye:* certificación de firmas ante escribano (el asesor le puede recomendar uno) ni domicilio legal.\n\n' +
+        '*Forma de pago:* transferencia del total antes de la presentación.\n\n' +
+        'Ante cualquier duda, con gusto coordinamos una breve reunión por Google Meet.';
+}
+
+const TEXTO_FORMULARIO_SAS =
+    '📋 *Datos para la constitución de su SAS*\n\n' +
+    `Para avanzar, complete estos datos y envíelos por correo a *${CORREO_DATOS_SAS}* (asunto: "Datos SAS" y su nombre):\n\n` +
+    '*1. La sociedad*\n' +
+    '• Denominación: 3 opciones en orden de preferencia (sin "SAS")\n' +
+    '• Actividad principal: a qué se va a dedicar\n' +
+    '• Sede social en CABA: calle, número, piso, depto. y código postal\n' +
+    '• Capital: ¿capital mínimo legal o un monto mayor? (si es mayor, indique el monto)\n' +
+    '• Fecha de cierre del ejercicio (por ejemplo, 31/12)\n' +
+    '• Correo electrónico de la sociedad\n\n' +
+    '*2. Cada socio*\n' +
+    '• Nombre y apellido, DNI y CUIT/CUIL\n' +
+    '• Nacionalidad, fecha de nacimiento, profesión y estado civil\n' +
+    '• Domicilio real completo\n' +
+    '• Porcentaje de participación\n\n' +
+    '*3. Administradores*\n' +
+    '• Titular o titulares (de 1 a 5) y un suplente (obligatorio); pueden ser socios o no, con los mismos datos que los socios\n' +
+    '• Para cada uno: si es o no Persona Expuesta Políticamente\n' +
+    '• Cuál de los titulares será el Administrador de Relaciones ante ARCA\n\n' +
+    '*4. Beneficiario final*\n' +
+    '• Quienes tengan el 10% o más del capital, con su porcentaje\n\n' +
+    '*Importante*\n' +
+    '• Verifique que sus datos personales estén correctos en ARCA: el sistema de IGJ los toma de ahí.\n' +
+    '• La firma del instrumento se certifica ante escribano; el asesor le puede recomendar uno.\n\n' +
+    'Ante cualquier duda, respóndanos por acá.';
+
+async function presupuestoEnConfirmacion() {
+    const { rows } = await db.query(`SELECT * FROM presupuestos WHERE estado = 'confirmando' AND actualizado > NOW() - ($1 || ' minutes')::interval ORDER BY actualizado DESC LIMIT 1`, [String(VIGENCIA_CONFIRMACION_MIN)]);
+    return rows[0] || null;
+}
+
+async function actualizarPresupuesto(id, campos) {
+    const claves = Object.keys(campos);
+    await db.query(`UPDATE presupuestos SET ${claves.map((k, i) => `${k} = $${i + 2}`).join(', ')}, actualizado = NOW() WHERE id = $1`, [id, ...claves.map(k => campos[k])]);
+    const { rows: [p] } = await db.query('SELECT * FROM presupuestos WHERE id = $1', [id]);
+    return p;
+}
+
+// Mensaje de la confirmación 1/3 (con el presupuesto completo).
+async function textoConfirmacion1(p) {
+    const c = await obtenerContacto(p.telefono);
+    const ars = totalPesos(p);
+    const lineas = [`💰 *Presupuesto para ${etiquetaContacto(c || {}, 'el cliente')}* · SAS`, ''];
+    if (p.a_cotizar) lineas.push(`⚠️ A cotizar por vos: ${(p.motivos || []).join('; ')}.`);
+    if (p.sin_sede) lineas.push('⚠️ El cliente no tiene dirección en CABA para la sede (se lo avisé).');
+    if (p.a_cotizar || p.sin_sede) lineas.push('');
+    lineas.push('— Así le llegaría —', '', textoPresupuestoCliente(p, c), '');
+    if (p.total_ars_manual) lineas.push(`Total fijado por vos: ${formatoPesos(p.total_ars_manual)}.`);
+    else if (p.tipo_cambio) lineas.push(`💵 Dólar oficial BNA vendedor usado: ${formatoPesos(p.tipo_cambio)}${p.fuente_cambio ? ` (fuente: ${p.fuente_cambio})` : ''}. Si no coincide con el del BNA, decime *dólar 1460* y lo recalculo.`);
+    else lineas.push('💵 No pude obtener el dólar oficial de hoy: decime el valor, por ejemplo *dólar 1460*.');
+    if (ars == null) {
+        lineas.push('', p.total_usd == null ? 'Falta el total: decime *total 900 dólares* o *total $1.200.000*.' : 'Falta el dólar del día para calcular el total en pesos.');
+    } else {
+        lineas.push('', '*(1/3)* ¿Lo envío? Respondé *sí* o *no*. También podés cambiarlo: *total 600 dólares*, *total $900.000* o *dólar 1460*.');
+    }
+    return lineas.join('\n');
+}
+
+async function iniciarConfirmacion(p) {
+    await db.query(`UPDATE presupuestos SET estado = 'borrador' WHERE estado = 'confirmando' AND id <> $1`, [p.id]);
+    p = await actualizarPresupuesto(p.id, { estado: 'confirmando', confirmaciones: 0 });
+    return textoConfirmacion1(p);
+}
+
+// Crea el presupuesto (desde el bot del cliente o desde el administrador) y arranca las confirmaciones.
+async function crearPresupuesto(telefono, args) {
+    const calc = calcularPresupuesto(args);
+    const dolar = await obtenerDolarOficial();
+    let negocio = null;
+    try {
+        negocio = (await negociosAbiertos(telefono)).find(g => g.especialidad === 'SAS') || await abrirNegocio(telefono, { especialidad: 'SAS', motivo: `Constitución de SAS · ${calc.socios} socio(s)` });
+    } catch (e) { /* sigue */ }
+    const { rows: [p] } = await db.query(
+        `INSERT INTO presupuestos (telefono, negocio_id, tramite, concepto, socios, total_usd, a_cotizar, motivos, sin_sede, tipo_cambio, fuente_cambio)
+         VALUES ($1, $2, 'SAS', $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+        [telefono, negocio?.id || null, calc.concepto, calc.socios, calc.total_usd, calc.a_cotizar, JSON.stringify(calc.motivos), args.sede_caba === false, dolar?.venta || null, dolar?.fuente || null]);
+    return p;
+}
+
+// El administrador responde mientras hay un presupuesto en confirmación. Devuelve el texto de respuesta o null.
+async function respuestaPresupuesto(texto) {
+    const p = await presupuestoEnConfirmacion();
+    if (!p) return null;
+    const t = normalizarTexto(texto);
+    const mDolar = String(texto).match(/d[oó]lar(?:\s+(?:oficial|hoy|bna|a|en|de))*\s*\$?\s*([\d.]+(?:,\d+)?)/i);
+    const mTotal = String(texto).match(/total\s*(?:en\s*)?(usd|u\$s|d[oó]lares)?\s*\$?\s*([\d.]+(?:,\d+)?)\s*(usd|u\$s|d[oó]lares)?/i);
+    const numero = s => Number(String(s).replace(/\./g, '').replace(',', '.'));
+    if (mDolar && !mTotal) {
+        const nuevo = await actualizarPresupuesto(p.id, { tipo_cambio: numero(mDolar[1]), fuente_cambio: 'indicado por vos', total_ars_manual: null, confirmaciones: 0 });
+        return textoConfirmacion1(nuevo);
+    }
+    if (mTotal) {
+        const enUsd = Boolean(mTotal[1] || mTotal[3]);
+        const valor = numero(mTotal[2]);
+        const nuevo = await actualizarPresupuesto(p.id, enUsd ? { total_usd: valor, total_ars_manual: null, confirmaciones: 0 } : { total_ars_manual: valor, confirmaciones: 0 });
+        return textoConfirmacion1(nuevo);
+    }
+    // Respuestas estrictas: un "no vino" o "sí, asistió" no se confunde con la confirmación del presupuesto.
+    if (/^(no|nop|no gracias|no lo envies|no lo mandes|no enviar|cancela|cancelar|cancelalo)$/.test(t)) {
+        await actualizarPresupuesto(p.id, { estado: 'cancelado' });
+        return 'Listo, no envío el presupuesto. 👍';
+    }
+    if (!/^(si|sii|ok|okey|dale|confirmo|confirmado|enviar|envialo|mandalo|si enviar|si envialo|si confirmo|de acuerdo|correcto|si correcto)$/.test(t)) return null; // cambió de tema: queda en espera
+    if (totalPesos(p) == null) return 'Antes de enviarlo necesito el total: decime *total 900 dólares* o *total $1.200.000*' + (p.tipo_cambio ? '.' : ', o el dólar del día (*dólar 1460*).');
+    const c = await obtenerContacto(p.telefono);
+    const quien = etiquetaContacto(c || {}, 'el cliente');
+    const n = (p.confirmaciones || 0) + 1;
+    if (n === 1) { await actualizarPresupuesto(p.id, { confirmaciones: 1 }); return '*(2/3)* ¿Revisaste los montos y el detalle? ¿Confirmo?'; }
+    if (n === 2) { await actualizarPresupuesto(p.id, { confirmaciones: 2 }); return `*(3/3)* Última confirmación: se envía a ${quien} un presupuesto de SAS por *${formatoPesos(totalPesos(p))}*. ¿Enviar ahora?`; }
+    // Tercer "sí": se envía.
+    try {
+        await enviarACliente(p.telefono, textoPresupuestoCliente(p, c));
+    } catch (e) {
+        return `No pude enviarlo por WhatsApp (${e.message}). Sigue pendiente: probá de nuevo con "mandale el presupuesto a ${c?.nombre || 'la persona'}".`;
+    }
+    await actualizarPresupuesto(p.id, { estado: 'enviado', confirmaciones: 3, enviado_en: new Date(), total_ars: totalPesos(p) });
+    if (p.negocio_id) {
+        await actualizarNegocio(p.negocio_id, { etapa: 'Propuesta enviada', monto_usd: p.total_usd || null }, `Presupuesto enviado: ${p.concepto} · ${formatoPesos(totalPesos(p))}${p.total_usd ? ` (${formatoUSD(p.total_usd)})` : ''}`).catch(() => {});
+    }
+    await db.query(`UPDATE seguimientos SET estado = 'cerrado' WHERE telefono = $1 AND estado = 'activo'`, [p.telefono]).catch(() => {});
+    return `✅ Presupuesto enviado a ${quien}. El negocio pasó a *Propuesta enviada*. Cuando pague, decime "${c?.nombre || 'X'} pagó" y le mando el formulario de datos.`;
+}
+
+// "Retomar" un presupuesto que quedó en espera.
+async function retomarPresupuesto({ cliente }) {
+    const c = await buscarContacto(cliente);
+    if (c.error) return { ok: false, mensaje: c.error };
+    const { rows: [p] } = await db.query(`SELECT * FROM presupuestos WHERE telefono = $1 AND estado IN ('borrador', 'confirmando') ORDER BY id DESC LIMIT 1`, [c.telefono]);
+    if (!p) return { ok: false, mensaje: `${etiquetaContacto(c)} no tiene ningún presupuesto en espera.` };
+    await enviarAAdmin(await iniciarConfirmacion(p), { anotar: true });
+    return { ok: true, mensaje: 'Te mostré el presupuesto en el mensaje anterior. Para enviarlo hacen falta 3 confirmaciones: respondé "sí" (1/3).' };
+}
+
+async function armarPresupuestoAdmin(args) {
+    const c = await buscarContacto(args.cliente);
+    if (c.error) return { ok: false, mensaje: c.error };
+    if (!args.socios) return { ok: false, mensaje: '¿Cuántos socios van a ser?' };
+    const p = await crearPresupuesto(c.telefono, { ...args, caba: args.caba !== false });
+    await enviarAAdmin(await iniciarConfirmacion(p), { anotar: true });
+    return { ok: true, mensaje: 'Te mostré el presupuesto en el mensaje anterior. Para enviarlo hacen falta 3 confirmaciones: respondé "sí" (1/3).' };
+}
+
+// El cliente pagó: negocio Ganado, pasa a cliente y le llega el formulario de datos.
+async function registrarPago({ cliente }) {
+    const c = await buscarContacto(cliente);
+    if (c.error) return { ok: false, mensaje: c.error };
+    const { rows: [p] } = await db.query(`SELECT * FROM presupuestos WHERE telefono = $1 AND estado = 'enviado' ORDER BY id DESC LIMIT 1`, [c.telefono]);
+    if (!p) return { ok: false, mensaje: `No encuentro ningún presupuesto enviado a ${etiquetaContacto(c)}. Si igual contrató, decime "${c.nombre || 'X'} contrató".` };
+    await enviarACliente(c.telefono, 'Muchas gracias por su confianza. Recibimos la confirmación del pago. 🙌\n\n' + TEXTO_FORMULARIO_SAS);
+    await actualizarPresupuesto(p.id, { estado: 'pagado' });
+    if (p.negocio_id) {
+        await actualizarNegocio(p.negocio_id, { etapa: 'Ganado' }, `Pagó el presupuesto (${formatoPesos(p.total_ars || totalPesos(p))})`).catch(() => {});
+    }
+    await db.query('UPDATE contactos SET es_cliente = TRUE, hubspot_sincronizado = FALSE WHERE telefono = $1', [c.telefono]);
+    return { ok: true, mensaje: `Listo: ${etiquetaContacto(c)} quedó como ⭐ cliente, el negocio pasó a *Ganado* y le mandé el formulario de datos para que lo envíe a ${CORREO_DATOS_SAS}.` };
+}
+
 // ==================== 7. Bot de clientes ====================
 
 // --- Reglas del administrador (instrucciones permanentes que se suman a las del bot) ---
@@ -1681,7 +1930,9 @@ function construirInstrucciones() {
         '3. Usá la frase "Esa es una excelente consulta" COMO MÁXIMO UNA SOLA VEZ en toda la conversación, y solo si la pregunta es específicamente sobre derecho societario.\n' +
         '4. NUNCA des asesoramiento legal específico ni redactes contratos.\n' +
         '5. Nunca prometas que lo va a atender un abogado: decí siempre "un asesor del Estudio".\n' +
-        '6. PRECIOS: NUNCA des precios, montos, rangos ni estimaciones, aunque insistan. Explicá con amabilidad que el valor depende de cada caso (cantidad de socios, objeto, urgencia) y que en la reunión el asesor le arma una propuesta completa y a medida. Si aún no lo indicó, pedí su correo electrónico.\n' +
+        '6. PRECIOS: NUNCA escribas precios, montos, rangos ni estimaciones, aunque insistan. ' +
+        'Si pide el precio o un presupuesto de una SAS, se lo preparamos: preguntá de a una (salteá lo que ya dijo) 1) si la sociedad va a estar en CABA, 2) cuántos socios van a ser, 3) si alguno de los socios es una empresa, 4) si alguno es extranjero y, en ese caso, si tiene CUIT o CUIL argentino, 5) si tiene una dirección en CABA para la sede (el Estudio no ofrece domicilio). Con eso usá preparar_presupuesto. ' +
+        'Para otros trámites (SRL, SA, mantenimiento, etc.) explicá que el valor depende del caso y que en la reunión el asesor arma una propuesta a medida. Si pregunta por el mantenimiento o las actas después de constituir, decile que el Estudio ofrece tarifas especiales para la confección de actas, que cotiza el asesor.\n' +
         '7. Sé conciso: máximo 2 a 4 oraciones breves. Estás respondiendo por WhatsApp. Hacé UNA pregunta por mensaje.\n' +
         '8. Servicios del Estudio: constitución de sociedades, mantenimiento societario (balances, asambleas ordinarias y extraordinarias, cambio de autoridades y gerencias), transferencias y procesos de disolución y cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.\n' +
         'PERFIL COMERCIAL (muy importante): tu objetivo es que el cliente quiera trabajar con el Estudio y llegue a la reunión interesado, sin presionarlo.\n' +
@@ -1775,6 +2026,23 @@ const HERRAMIENTAS_CLIENTE = [
                 nombre_cliente: { type: 'STRING', description: 'Nombre y apellido del cliente, si todavía no lo tenemos guardado.' }
             },
             required: ['area', 'resumen']
+        }
+    },
+    {
+        name: 'preparar_presupuesto',
+        description: 'Prepara el presupuesto de una SAS con las respuestas del cliente. El asesor lo revisa y se lo envía; vos NUNCA digas montos.',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                tramite: { type: 'STRING', enum: ['SAS'] },
+                caba: { type: 'BOOLEAN', description: 'true si la sociedad va a estar en la Ciudad Autónoma de Buenos Aires.' },
+                socios: { type: 'INTEGER', description: 'Cantidad de socios.' },
+                socio_empresa: { type: 'BOOLEAN', description: 'true si algún socio es una empresa (persona jurídica), argentina o extranjera.' },
+                extranjero_sin_cuit: { type: 'BOOLEAN', description: 'true si algún socio es extranjero y NO tiene CUIT ni CUIL argentino.' },
+                sede_caba: { type: 'BOOLEAN', description: 'true si tiene una dirección en CABA para la sede social.' },
+                nombre_cliente: { type: 'STRING', description: 'Nombre y apellido, si todavía no lo tenemos.' }
+            },
+            required: ['tramite', 'caba', 'socios', 'socio_empresa', 'extranjero_sin_cuit', 'sede_caba']
         }
     },
     {
@@ -2116,6 +2384,23 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             if (!si && !preguntaAsistenciaAbierta(t)) return { error: 'No hay ninguna pregunta de asistencia pendiente. Si quiere cancelar, usá cancelar_mi_turno.' };
             await procesarRespuestaAsistencia(t, si);
             return { ok: true, _silencio: true };
+        }
+
+        if (nombre === 'preparar_presupuesto') {
+            if (args.tramite !== 'SAS') return { error: 'Por ahora el presupuesto automático es solo para SAS. Para este trámite ofrecé la reunión sin cargo.' };
+            let ficha = contacto;
+            if (!(ficha?.nombre && ficha.nombre !== 'No indicado')) {
+                const dado = limpiarNombre(args.nombre_cliente || '');
+                if (!dado) return { error: 'Antes de preparar el presupuesto, preguntale su nombre y apellido (y volvé a llamar con "nombre_cliente").' };
+                await db.query(`INSERT INTO contactos (telefono, nombre) VALUES ($1, $2) ON CONFLICT (telefono) DO UPDATE SET nombre = EXCLUDED.nombre`, [telefono, dado]);
+            }
+            const faltan = ['caba', 'socios', 'socio_empresa', 'extranjero_sin_cuit', 'sede_caba'].filter(k => args[k] === undefined || args[k] === null);
+            if (faltan.length) return { error: `Todavía falta preguntarle: ${faltan.join(', ')}. Preguntá de a una.` };
+            const { rows: [ya] } = await db.query(`SELECT id FROM presupuestos WHERE telefono = $1 AND estado IN ('borrador', 'confirmando') AND creado > NOW() - INTERVAL '1 day'`, [telefono]);
+            if (ya) return { ok: true, ya_en_preparacion: true, indicacion: 'Ya le estamos preparando el presupuesto: decile que el asesor se lo envía a la brevedad. No digas montos.' };
+            const p = await crearPresupuesto(telefono, args);
+            await enviarAAdmin(await iniciarConfirmacion(p), { anotar: true });
+            return { ok: true, en_preparacion: true, indicacion: `Decile que con esos datos el asesor le prepara el presupuesto y se lo envía a la brevedad por este medio. NO digas ningún monto.${args.sede_caba === false ? ' Avisale con amabilidad que para constituir la SAS en CABA hace falta una dirección en CABA para la sede, y que el Estudio no ofrece domicilio.' : ''}` };
         }
 
         if (nombre === 'derivar_consulta') {
@@ -2655,6 +2940,7 @@ async function conversarConHerramientas({ instrucciones, contents, herramientas,
 }
 
 // respuestaAlAsesor: true si este mensaje es la primera respuesta del cliente a un mensaje que le escribió el asesor.
+const REGEX_MONTO = /(\$|usd|u\$s|us\$)\s?\d|\d[\d.,]*\s?(usd|u\$s|d[oó]lares|pesos)\b/i;
 const REGEX_DICE_AGREGADO = /\b(agregamos|agregaremos|agregu[ée]|sumamos|sumaremos|sum[ée]|qued[óo] (agregad|sumad|incluid)|incluimos|incluiremos)\b[^.?!]{0,80}\b(tema|consulta)/i;
 
 async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = false } = {}) {
@@ -2713,6 +2999,10 @@ async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = 
         }
     });
     if (silencio) return '';
+    if (reply && REGEX_MONTO.test(reply)) {
+        console.warn('El modelo escribió un monto; se reemplaza.');
+        return 'Los valores dependen de cada caso: el asesor le prepara un presupuesto a medida y se lo envía por este medio. Si es una SAS, con unos pocos datos se lo armamos.';
+    }
     if (reply && !temaAgregado && REGEX_DICE_AGREGADO.test(reply)) {
         // Dice que sumó un tema que nunca se sumó: se corrige con la pregunta que corresponde.
         const vig = await turnosActivosCliente(remitenteId);
@@ -2987,6 +3277,23 @@ const HERRAMIENTAS_ADMIN = [
             nota: { type: 'STRING', description: 'Detalle breve que haya dado el administrador (opcional).' } }, required: ['resultado'] }
     },
     {
+        name: 'armar_presupuesto', description: 'Arma un presupuesto de SAS para un cliente (con la tabla de precios) y arranca las 3 confirmaciones antes de enviarlo.',
+        parameters: { type: 'OBJECT', properties: {
+            cliente: { type: 'STRING', description: 'Nombre o teléfono.' },
+            socios: { type: 'INTEGER' },
+            caba: { type: 'BOOLEAN', description: 'false si no es en CABA (queda a cotizar).' },
+            socio_empresa: { type: 'BOOLEAN' },
+            extranjero_sin_cuit: { type: 'BOOLEAN' } }, required: ['cliente', 'socios'] }
+    },
+    {
+        name: 'retomar_presupuesto', description: 'Vuelve a mostrar un presupuesto que quedó en espera para confirmarlo y enviarlo ("mandale el presupuesto a X").',
+        parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING' } }, required: ['cliente'] }
+    },
+    {
+        name: 'registrar_pago', description: 'El cliente pagó el presupuesto: negocio Ganado, pasa a cliente y le llega el formulario de datos de la SAS.',
+        parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING' } }, required: ['cliente'] }
+    },
+    {
         name: 'detener_seguimiento', description: 'Deja de mandarle los mensajes de seguimiento (días 2, 7 y 15) a una persona que no vino o pidió que la contactemos más adelante.',
         parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono de la persona.' } }, required: ['cliente'] }
     },
@@ -3111,6 +3418,9 @@ async function ejecutarAccionAdmin(nombre, args) {
         case 'reiniciar_contacto': return reiniciarContacto(args);
         case 'resultado_negocio': return registrarResultado(args);
         case 'detener_seguimiento': return detenerSeguimiento(args);
+        case 'armar_presupuesto': return armarPresupuestoAdmin(args);
+        case 'retomar_presupuesto': return retomarPresupuesto(args);
+        case 'registrar_pago': return registrarPago(args);
         case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
         case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
         case 'restablecer_dia': return restablecerDia(args.fecha);
@@ -3160,6 +3470,7 @@ async function instruccionesAdmin() {
         'Para una reunión NUEVA de un cliente (otro tema, o una consulta "⚖️ para evaluar" con día y hora) usá agendar_reunion: NUNCA muevas su reunión actual para eso. ' +
         'Para aceptar una consulta "⚖️ para evaluar" sin día ni hora ("decile que sí") usá atender_consulta; para no tomarla, no_atender_consulta. Identificá al cliente por el nombre o el teléfono que figura en el aviso: nunca lo confundas con otro cliente de la conversación.\n' +
         'SEGUIMIENTO (HubSpot): cuando te diga cómo siguió una persona usá resultado_negocio: "asistió" / "no vino" → asistio / no_asistio; "le mandé la propuesta" → propuesta_enviada; "contrató", "cerramos", "pagó" → ganado (además lo marca como cliente); "no siguió", "no le interesa", "lo perdimos" → perdido. Si la reunión tiene número, pasalo en turno_id.\n' +
+        'PRESUPUESTOS: "cotizale a X una SAS con N socios" → armar_presupuesto; "mandale el presupuesto a X" → retomar_presupuesto; "X pagó" → registrar_pago. El envío del presupuesto lo maneja el sistema con 3 confirmaciones: vos nunca digas que lo enviaste.\n' +
         'Si te dice "no le escribas más a X" (o que no le mandes más seguimientos), usá detener_seguimiento.\n' +
         'Si te pide reiniciar, resetear o borrar a una persona para probar ("que el bot crea que es nuevo"), usá reiniciar_contacto con ESA persona. Nunca reinicies a varias juntas ni a alguien que no nombró.\n' +
         'HORAS: usá solo una hora que haya dicho el administrador o el cliente (por ejemplo "a las 17:15"). Si dicen "después de la otra reunión" o algo sin hora, preguntá a qué hora, indicando a qué hora termina la reunión actual. Nunca elijas una hora por tu cuenta.\n' +
@@ -3192,6 +3503,10 @@ async function procesarMensajeAdmin(sock, sender, text) {
         await sock.sendMessage(sender, { text: t });
         recordarEnHistorialAdmin(text, t);
     };
+
+    // 0) Presupuesto esperando tus 3 confirmaciones (o un cambio: "dólar 1460", "total $900.000").
+    const rPresu = await respuestaPresupuesto(text).catch(e => { console.error('Presupuesto:', e.message); return null; });
+    if (rPresu) return responder(rPresu);
 
     // 1) Respuesta a una acción que quedó esperando confirmación.
     const pendiente = await leerAccionPendiente();
@@ -3918,6 +4233,7 @@ async function enviarNegocio(g, et) {
     const properties = { dealname: `${nombre} · ${g.titulo || 'Consulta'}`.slice(0, 250), pipeline: et.pipeline, description: descripcionNegocio(g, c) };
     const etapa = et.ids[normalizarTexto(g.etapa)];
     if (etapa) properties.dealstage = etapa;
+    if (g.monto_usd != null) properties.amount = String(g.monto_usd);
     if (g.cerrado) properties.closedate = new Date(g.actualizado_en || Date.now()).toISOString();
     let id = g.hubspot_id;
     if (id) {
@@ -4288,12 +4604,12 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
     // base
     inicializarDB, guardarConfig, db,
     _historialAdmin: () => historialAdmin,
-    _set: (k, v) => { if (k === 'socket') socketActual = v; if (k === 'conectado') isConnected = v; if (k === 'dbOk') dbOk = v; if (k === 'horarioSeguimiento') respetarHorarioSeguimiento = v; }
+    _set: (k, v) => { if (k === 'socket') socketActual = v; if (k === 'conectado') isConnected = v; if (k === 'dbOk') dbOk = v; if (k === 'horarioSeguimiento') respetarHorarioSeguimiento = v; if (k === 'dolar') dolarDelDia = v; }
 };
