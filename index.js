@@ -259,6 +259,8 @@ async function inicializarDB() {
         await db.query(`ALTER TABLE presupuestos ADD COLUMN IF NOT EXISTS token_formulario TEXT`);
         await db.query(`ALTER TABLE presupuestos ADD COLUMN IF NOT EXISTS formulario_completado_en TIMESTAMPTZ`);
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS inscripta_en TIMESTAMPTZ`);
+        await db.query(`ALTER TABLE presupuestos ADD COLUMN IF NOT EXISTS jurisdiccion TEXT`);
+        await db.query(`ALTER TABLE presupuestos ADD COLUMN IF NOT EXISTS referencia_usd NUMERIC`);
         await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS resena_pedida_en TIMESTAMPTZ`);
         await db.query(`CREATE TABLE IF NOT EXISTS eventos_negocio (id SERIAL PRIMARY KEY, negocio_id INTEGER, telefono TEXT, etapa TEXT, creado TIMESTAMPTZ DEFAULT NOW())`);
         await db.query(`
@@ -1684,8 +1686,8 @@ async function leerEsperandoRespuesta(telefono) {
 }
 
 // ==================== 6b. Cotizador (presupuestos) ====================
-// El bot hace las preguntas, calcula con la tabla y arma el presupuesto. Nunca le da un número al cliente:
-// el presupuesto se envía solo después de 3 confirmaciones del administrador.
+// v27: primero la reunión. El bot junta los datos (tipo, jurisdicción, socios…) y prioriza agendar la reunión virtual.
+// Después de la reunión ("asistió") te pregunta si se cotiza; el total lo ponés vos y se envía con 3 confirmaciones.
 
 const TARIFAS = {
     SAS: { base_usd: 550, socios_incluidos: 2, socio_adicional_usd: 15 }
@@ -1713,18 +1715,85 @@ async function obtenerDolarOficial() {
     return null;
 }
 
-// Calcula el presupuesto. Si hay algo fuera de lo estándar, queda "a cotizar por el asesor".
-function calcularPresupuesto({ tramite = 'SAS', socios, caba = true, socio_empresa = false, extranjero_sin_cuit = false }) {
-    const t = TARIFAS[tramite];
-    const n = Math.max(1, Math.floor(Number(socios) || 0));
+// Datos de la cotización: tipo de trámite y jurisdicción.
+const TIPOS_CONSTITUCION = { SAS: 'SAS', SRL: 'SRL', SA: 'SA', 'ASOCIACION CIVIL': 'Asociación Civil', 'ASOCIACION CIVIL / ONG': 'Asociación Civil', ONG: 'Asociación Civil', FUNDACION: 'Fundación' };
+function normalizarTramite(t) {
+    const n = normalizarTexto(t).toUpperCase();
+    if (!n) return 'SAS';
+    if (/^S\s?A\s?S$|ACCIONES SIMPLIFICADA/.test(n)) return 'SAS';
+    if (/^S\s?R\s?L$|RESPONSABILIDAD LIMITADA/.test(n)) return 'SRL';
+    if (/^S\s?A$|SOCIEDAD ANONIMA/.test(n)) return 'SA';
+    if (/ASOCIACION|ONG/.test(n)) return 'Asociación Civil';
+    if (/FUNDACION/.test(n)) return 'Fundación';
+    return String(t).trim();
+}
+const esConstitucion = t => ['SAS', 'SRL', 'SA', 'Asociación Civil', 'Fundación'].includes(t);
+function tipoJurisdiccion(j) {
+    const n = normalizarTexto(j);
+    if (!n) return null;
+    if (/\b(caba|capital federal|capital|ciudad autonoma|ciudad de buenos aires)\b/.test(n)) return 'CABA';
+    if (/\b(provincia de buenos aires|pba|prov de buenos aires|provincia de bs as|gran buenos aires|conurbano)\b/.test(n) || n === 'buenos aires' || n === 'provincia') return 'PBA';
+    return 'OTRA';
+}
+function textoJurisdiccion(j) {
+    const t = tipoJurisdiccion(j);
+    if (t === 'CABA') return 'la Ciudad Autónoma de Buenos Aires';
+    if (t === 'PBA') return 'la Provincia de Buenos Aires';
+    return t ? String(j).trim() : null;
+}
+function conceptoPresupuesto({ tramite, jurisdiccion, socios }) {
+    const tr = normalizarTramite(tramite);
+    const tj = tipoJurisdiccion(jurisdiccion);
+    const lugar = tj === 'CABA' ? ' en CABA' : tj === 'PBA' ? ' en Provincia de Buenos Aires' : tj ? ` en ${String(jurisdiccion).trim()}` : '';
+    const n = Math.floor(Number(socios) || 0);
+    const soc = n > 0 && ['SAS', 'SRL', 'SA'].includes(tr) ? ` · ${n} socio${n === 1 ? '' : 's'}` : '';
+    return (esConstitucion(tr) ? `Constitución de ${tr}` : tr) + lugar + soc;
+}
+
+// Arma la base del presupuesto: el total SIEMPRE lo pone el asesor. Para una SAS estándar en CABA muestra la referencia de la tabla.
+function calcularPresupuesto({ tramite = 'SAS', socios, jurisdiccion, caba, socio_empresa = false, extranjero_sin_cuit = false }) {
+    const tr = normalizarTramite(tramite);
+    const jur = jurisdiccion || (caba === true ? 'CABA' : caba === false ? 'fuera de CABA' : null);
+    const enCABA = tipoJurisdiccion(jur) === 'CABA';
+    const n = Math.floor(Number(socios) || 0) || null;
     const motivos = [];
-    if (!caba) motivos.push('la sociedad no es en CABA');
+    if (jur && !enCABA) motivos.push('la sociedad no es en CABA');
     if (socio_empresa) motivos.push('hay un socio que es una empresa');
     if (extranjero_sin_cuit) motivos.push('hay un socio extranjero sin CUIT/CUIL argentino');
-    const concepto = `Constitución de ${tramite}${caba ? ' en CABA' : ''} · ${n} socio${n === 1 ? '' : 's'}`;
-    if (!t || motivos.length) return { concepto, socios: n, total_usd: null, a_cotizar: true, motivos };
-    const total_usd = t.base_usd + Math.max(0, n - t.socios_incluidos) * t.socio_adicional_usd;
-    return { concepto, socios: n, total_usd, a_cotizar: false, motivos };
+    const t = TARIFAS[tr];
+    const estandar = t && enCABA && n && !socio_empresa && !extranjero_sin_cuit;
+    const referencia_usd = estandar ? t.base_usd + Math.max(0, n - t.socios_incluidos) * t.socio_adicional_usd : null;
+    return { tramite: tr, jurisdiccion: jur, concepto: conceptoPresupuesto({ tramite: tr, jurisdiccion: jur, socios: n }), socios: n, total_usd: null, a_cotizar: true, motivos, referencia_usd };
+}
+
+// Datos que el bot va juntando en la conversación (para que el asesor cotice después de la reunión).
+async function leerDatosCotizacion(telefono) { return leerConfigJSON(`datos_cotizacion:${telefono}`, 180); }
+async function anotarDatosCotizacion(telefono, nuevos) {
+    const prev = (await leerDatosCotizacion(telefono)) || {};
+    const d = { ...prev };
+    for (const k of ['tramite', 'jurisdiccion', 'socios', 'socio_empresa', 'extranjero_sin_cuit', 'sede', 'detalle']) {
+        if (nuevos[k] !== undefined && nuevos[k] !== null && nuevos[k] !== '') d[k] = nuevos[k];
+    }
+    if (d.tramite) d.tramite = normalizarTramite(d.tramite);
+    if (nuevos.sede_caba !== undefined && d.sede === undefined) d.sede = nuevos.sede_caba;
+    if (nuevos.caba !== undefined && !d.jurisdiccion) d.jurisdiccion = nuevos.caba ? 'CABA' : null;
+    d.creada = Date.now();
+    await guardarConfig(`datos_cotizacion:${telefono}`, JSON.stringify(d));
+    return d;
+}
+function resumenDatosCotizacion(d) {
+    if (!d) return null;
+    const sn = v => v === true ? 'sí' : v === false ? 'no' : null;
+    const partes = [
+        d.tramite && `Trámite: ${d.tramite}`,
+        d.jurisdiccion && `Jurisdicción: ${textoJurisdiccion(d.jurisdiccion) ? textoJurisdiccion(d.jurisdiccion).replace(/^la /, '') : d.jurisdiccion}`,
+        d.socios && `Socios: ${d.socios}`,
+        sn(d.socio_empresa) && `Socio empresa: ${sn(d.socio_empresa)}`,
+        sn(d.extranjero_sin_cuit) && `Extranjero sin CUIT/CUIL: ${sn(d.extranjero_sin_cuit)}`,
+        sn(d.sede) && `Dirección para la sede: ${sn(d.sede)}`,
+        d.detalle && `Detalle: ${d.detalle}`
+    ].filter(Boolean);
+    return partes.length ? partes.join(' · ') : null;
 }
 
 function totalPesos(p) {
@@ -1736,12 +1805,21 @@ function totalPesos(p) {
 function textoPresupuestoCliente(p, c) {
     const nombre = c?.nombre && !/^no (indicado|detectado)$/i.test(c.nombre) ? c.nombre : null;
     const ars = totalPesos(p);
-    const equivalente = '\n_Válido por 15 días._'; // al cliente se le cotiza siempre en pesos
+    const tr = normalizarTramite(p.tramite || 'SAS');
+    const jurTxt = textoJurisdiccion(p.jurisdiccion);
+    const constitucion = esConstitucion(tr);
+    const sasCABA = tr === 'SAS' && tipoJurisdiccion(p.jurisdiccion || 'CABA') === 'CABA';
+    const que = constitucion ? `la *constitución de su ${tr}${jurTxt ? ` en ${jurTxt}` : ''}*` : `*${p.concepto}*`;
+    const incluye = sasCABA
+        ? '*Incluye:* redacción del instrumento constitutivo, inscripción en IGJ con tasa y publicación en el Boletín Oficial, Formulario 185, alta de CUIT en ARCA y apertura de libros. Presentación en un máximo de 48 horas hábiles.'
+        : constitucion
+            ? '*Incluye:* honorarios del Estudio, redacción del instrumento constitutivo y gestión de la inscripción ante el organismo que corresponde, según lo conversado con el asesor. Presentación en un máximo de 48 horas hábiles desde que recibimos la documentación completa.'
+            : '*Incluye:* honorarios del Estudio y la gestión del trámite, según lo conversado con el asesor.';
     return `📄 *Presupuesto · Estudio Jaime Irigoyen*\n\n${nombre ? `Estimado/a ${nombre}:` : 'Estimado/a:'}\n\n` +
-        `Le enviamos el presupuesto para la *constitución de su SAS en la Ciudad Autónoma de Buenos Aires*:\n\n` +
-        `*${p.concepto}: ${ars != null ? formatoPesos(ars) : '(a cotizar)'}* (IVA incluido)${equivalente}\n\n` +
-        '*Incluye:* redacción del instrumento constitutivo, inscripción en IGJ con tasa y publicación en el Boletín Oficial, Formulario 185, alta de CUIT en ARCA y apertura de libros. Presentación en un máximo de 48 horas hábiles.\n\n' +
-        '*No incluye:* certificación de firmas ante escribano (el asesor le puede recomendar uno) ni domicilio legal.\n\n' +
+        `Le enviamos el presupuesto para ${que}:\n\n` +
+        `*${p.concepto}: ${ars != null ? formatoPesos(ars) : '(a cotizar)'}* (IVA incluido)\n_Válido por 15 días._\n\n` +
+        incluye + '\n\n' +
+        (constitucion ? '*No incluye:* certificación de firmas ante escribano (el asesor le puede recomendar uno) ni domicilio legal.\n\n' : '') +
         '*Forma de pago:* transferencia del total antes de la presentación.\n\n' +
         'Ante cualquier duda, con gusto coordinamos una breve reunión por Google Meet.';
 }
@@ -1788,16 +1866,17 @@ async function actualizarPresupuesto(id, campos) {
 async function textoConfirmacion1(p) {
     const c = await obtenerContacto(p.telefono);
     const ars = totalPesos(p);
-    const lineas = [`💰 *Presupuesto para ${etiquetaContacto(c || {}, 'el cliente')}* · SAS`, ''];
+    const lineas = [`💰 *Presupuesto para ${etiquetaContacto(c || {}, 'el cliente')}* · ${normalizarTramite(p.tramite || 'SAS')}`, ''];
     if (p.a_cotizar) lineas.push(`⚠️ A cotizar por vos: ${(p.motivos || []).join('; ')}.`);
     if (p.sin_sede) lineas.push('⚠️ El cliente no tiene dirección en CABA para la sede (se lo avisé).');
-    if (p.a_cotizar || p.sin_sede) lineas.push('');
+    if (p.referencia_usd && p.total_usd == null && !p.total_ars_manual) lineas.push(`📊 Referencia de la tabla: ${formatoUSD(p.referencia_usd)}. Si te sirve, respondé *total ${Number(p.referencia_usd)} dólares*.`);
+    if (p.a_cotizar || p.sin_sede || p.referencia_usd) lineas.push('');
     lineas.push('— Así le llegaría —', '', textoPresupuestoCliente(p, c), '');
     if (p.total_ars_manual) lineas.push(`Total fijado por vos: ${formatoPesos(p.total_ars_manual)}.`);
-    else if (p.tipo_cambio) lineas.push(`💵 ${p.total_usd != null ? `${formatoUSD(p.total_usd)} × ` : ''}dólar oficial BNA vendedor ${formatoPesos(p.tipo_cambio)}${p.fuente_cambio ? ` (fuente: ${p.fuente_cambio})` : ''}. Si no coincide con el del BNA, decime *dólar 1460* y lo recalculo.`);
-    else lineas.push('💵 No pude obtener el dólar oficial de hoy: decime el valor, por ejemplo *dólar 1460*.');
+    else if (p.tipo_cambio && p.total_usd != null) lineas.push(`💵 ${p.total_usd != null ? `${formatoUSD(p.total_usd)} × ` : ''}dólar oficial BNA vendedor ${formatoPesos(p.tipo_cambio)}${p.fuente_cambio ? ` (fuente: ${p.fuente_cambio})` : ''}. Si no coincide con el del BNA, decime *dólar 1460* y lo recalculo.`);
+    else if (!p.tipo_cambio) lineas.push('💵 No pude obtener el dólar oficial de hoy: si cotizás en dólares, decime el valor, por ejemplo *dólar 1460*.');
     if (ars == null) {
-        lineas.push('', p.total_usd == null ? 'Falta el total: decime *total 900 dólares* o *total $1.200.000*.' : 'Falta el dólar del día para calcular el total en pesos.');
+        lineas.push('', p.total_usd == null ? 'Falta el total (lo ponés vos): decime *total $1.200.000* o *total 900 dólares*.' : 'Falta el dólar del día para calcular el total en pesos.');
     } else {
         lineas.push('', '*(1/3)* ¿Lo envío? Respondé *sí* o *no*. También podés cambiarlo: *total 600 dólares*, *total $900.000* o *dólar 1460*.');
     }
@@ -1810,19 +1889,55 @@ async function iniciarConfirmacion(p) {
     return textoConfirmacion1(p);
 }
 
-// Crea el presupuesto (desde el bot del cliente o desde el administrador) y arranca las confirmaciones.
+// Crea el presupuesto (siempre lo pide el administrador) con los datos que juntó el bot. El total lo pone el administrador.
 async function crearPresupuesto(telefono, args) {
     const calc = calcularPresupuesto(args);
     const dolar = await obtenerDolarOficial();
+    const esp = ESPECIALIDADES.find(e => normalizarTexto(e) === normalizarTexto(calc.tramite)) || (calc.tramite === 'Asociación Civil' ? 'Asociación Civil / ONG' : null);
     let negocio = null;
     try {
-        negocio = (await negociosAbiertos(telefono)).find(g => g.especialidad === 'SAS') || await abrirNegocio(telefono, { especialidad: 'SAS', motivo: `Constitución de SAS · ${calc.socios} socio(s)` });
+        const abiertos = await negociosAbiertos(telefono);
+        negocio = (esp && abiertos.find(g => g.especialidad === esp)) || abiertos[0] || await abrirNegocio(telefono, { especialidad: esp, motivo: calc.concepto });
+        if (negocio && esp && !negocio.especialidad) negocio = await actualizarNegocio(negocio.id, { especialidad: esp, titulo: esp }, `Trámite: ${calc.concepto}`);
     } catch (e) { /* sigue */ }
     const { rows: [p] } = await db.query(
-        `INSERT INTO presupuestos (telefono, negocio_id, tramite, concepto, socios, total_usd, a_cotizar, motivos, sin_sede, tipo_cambio, fuente_cambio)
-         VALUES ($1, $2, 'SAS', $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-        [telefono, negocio?.id || null, calc.concepto, calc.socios, calc.total_usd, calc.a_cotizar, JSON.stringify(calc.motivos), args.sede_caba === false, dolar?.venta || null, dolar?.fuente || null]);
+        `INSERT INTO presupuestos (telefono, negocio_id, tramite, concepto, socios, total_usd, a_cotizar, motivos, sin_sede, tipo_cambio, fuente_cambio, jurisdiccion, referencia_usd)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+        [telefono, negocio?.id || null, calc.tramite, calc.concepto, calc.socios, calc.total_usd, calc.a_cotizar, JSON.stringify(calc.motivos),
+            calc.tramite === 'SAS' && tipoJurisdiccion(calc.jurisdiccion) === 'CABA' && (args.sede === false || args.sede_caba === false),
+            dolar?.venta || null, dolar?.fuente || null, calc.jurisdiccion, calc.referencia_usd]);
     return p;
+}
+
+// Después de "asistió": te pregunta si hay que cotizar, con los datos que juntó el bot.
+async function ofrecerCotizacion(telefono, negocio) {
+    const { rows: [ya] } = await db.query(`SELECT 1 FROM presupuestos WHERE telefono = $1 AND estado IN ('confirmando', 'enviado', 'pagado') AND creado > NOW() - INTERVAL '30 days' LIMIT 1`, [telefono]);
+    if (ya) return null;
+    const c = await obtenerContacto(telefono);
+    const datos = await leerDatosCotizacion(telefono);
+    await guardarConfig('cotizar_pendiente', JSON.stringify({ telefono, negocio_id: negocio?.id || null, creada: Date.now(), turno: contadorAdmin }));
+    return `💼 ¿Le cotizamos a ${etiquetaContacto(c || {}, 'esta persona')}?\n` +
+        (resumenDatosCotizacion(datos) ? `Datos que juntó el bot: ${resumenDatosCotizacion(datos)}` : 'El bot no llegó a juntar datos: si los tenés, decímelos al armarlo (por ejemplo "cotizale a X una SRL en Provincia con 3 socios").') +
+        `\nRespondé *sí* (te pido el total) o *no*. Si preferís verlo más tarde: *cotizale a ${c?.nombre || 'X'}*.`;
+}
+
+async function respuestaCotizar(texto) {
+    const pend = await leerConfigJSON('cotizar_pendiente', 1);
+    if (!pend || Date.now() - pend.creada > 24 * 3600000) return null;
+    // Vale solo como respuesta inmediata a la pregunta: si escribiste otra cosa en el medio, se usa "cotizale a X".
+    if (pend.turno != null && contadorAdmin !== pend.turno + 1) { await borrarConfig('cotizar_pendiente'); return null; }
+    const t = normalizarTexto(texto);
+    const c = await obtenerContacto(pend.telefono);
+    if (/^(no|nop|no gracias|no cotizar|no le cotices|no hace falta|todavia no|por ahora no|no por ahora)$/.test(t)) {
+        await borrarConfig('cotizar_pendiente');
+        if (pend.negocio_id) await actualizarNegocio(pend.negocio_id, {}, 'Después de la reunión: el asesor decidió no cotizar por ahora').catch(() => {});
+        return `Listo, no le cotizo. Si más adelante querés hacerlo, decime *cotizale a ${c?.nombre || 'X'}*.`;
+    }
+    if (!/^(si|sii|ok|dale|cotiza|cotizale|si cotiza|si cotizale|si cotizar|si hay que cotizar|si dale|si por favor|cotizamos|si cotizamos)$/.test(t)) return null;
+    await borrarConfig('cotizar_pendiente');
+    const datos = (await leerDatosCotizacion(pend.telefono)) || {};
+    const p = await crearPresupuesto(pend.telefono, datos);
+    return iniciarConfirmacion(p);
 }
 
 // El administrador responde mientras hay un presupuesto en confirmación. Devuelve el texto de respuesta o null.
@@ -1854,7 +1969,7 @@ async function respuestaPresupuesto(texto) {
     const quien = etiquetaContacto(c || {}, 'el cliente');
     const n = (p.confirmaciones || 0) + 1;
     if (n === 1) { await actualizarPresupuesto(p.id, { confirmaciones: 1 }); return '*(2/3)* ¿Revisaste los montos y el detalle? ¿Confirmo?'; }
-    if (n === 2) { await actualizarPresupuesto(p.id, { confirmaciones: 2 }); return `*(3/3)* Última confirmación: se envía a ${quien} un presupuesto de SAS por *${formatoPesos(totalPesos(p))}*. ¿Enviar ahora?`; }
+    if (n === 2) { await actualizarPresupuesto(p.id, { confirmaciones: 2 }); return `*(3/3)* Última confirmación: se envía a ${quien} el presupuesto «${p.concepto}» por *${formatoPesos(totalPesos(p))}*. ¿Enviar ahora?`; }
     // Tercer "sí": se envía.
     try {
         await enviarACliente(p.telefono, textoPresupuestoCliente(p, c));
@@ -1882,8 +1997,10 @@ async function retomarPresupuesto({ cliente }) {
 async function armarPresupuestoAdmin(args) {
     const c = await buscarContacto(args.cliente);
     if (c.error) return { ok: false, mensaje: c.error };
-    if (!args.socios) return { ok: false, mensaje: '¿Cuántos socios van a ser?' };
-    const p = await crearPresupuesto(c.telefono, { ...args, caba: args.caba !== false });
+    const guardados = (await leerDatosCotizacion(c.telefono)) || {};
+    const datos = await anotarDatosCotizacion(c.telefono, args);
+    const p = await crearPresupuesto(c.telefono, { ...guardados, ...datos });
+    await borrarConfig('cotizar_pendiente');
     await enviarAAdmin(await iniciarConfirmacion(p), { anotar: true });
     return { ok: true, mensaje: 'Te mostré el presupuesto en el mensaje anterior. Para enviarlo hacen falta 3 confirmaciones: respondé "sí" (1/3).' };
 }
@@ -1894,13 +2011,22 @@ async function registrarPago({ cliente }) {
     if (c.error) return { ok: false, mensaje: c.error };
     const { rows: [p] } = await db.query(`SELECT * FROM presupuestos WHERE telefono = $1 AND estado = 'enviado' ORDER BY id DESC LIMIT 1`, [c.telefono]);
     if (!p) return { ok: false, mensaje: `No encuentro ningún presupuesto enviado a ${etiquetaContacto(c)}. Si igual contrató, decime "${c.nombre || 'X'} contrató".` };
-    const link = await linkFormularioSAS(p, c);
-    await enviarACliente(c.telefono, link
+    const esSAS = normalizarTramite(p.tramite || 'SAS') === 'SAS';
+    const link = esSAS ? await linkFormularioSAS(p, c) : null;
+    if (!esSAS) {
+        await enviarACliente(c.telefono, 'Muchas gracias por su confianza. Recibimos la confirmación del pago. 🙌\n\nEl asesor le indica por este medio los próximos pasos y la documentación necesaria para avanzar con ' + (esConstitucion(normalizarTramite(p.tramite)) ? `la constitución de su ${normalizarTramite(p.tramite)}.` : 'el trámite.'));
+    } else await enviarACliente(c.telefono, link
         ? 'Muchas gracias por su confianza. Recibimos la confirmación del pago. 🙌\n\n' +
           `Para iniciar la constitución de su SAS, complete este formulario con los datos de la sociedad, los socios y los administradores:\n👉 ${link}\n\n` +
           'Le lleva unos 10 minutos. Al terminar le llega una copia por correo y el asesor recibe la información para comenzar.\n\n' +
           'Recuerde que la firma del instrumento se certifica ante escribano; el asesor le puede recomendar uno.'
         : 'Muchas gracias por su confianza. Recibimos la confirmación del pago. 🙌\n\n' + TEXTO_FORMULARIO_SAS);
+    if (!esSAS) {
+        await actualizarPresupuesto(p.id, { estado: 'pagado' });
+        if (p.negocio_id) await actualizarNegocio(p.negocio_id, { etapa: 'Ganado' }, `Pagó el presupuesto (${formatoPesos(p.total_ars || totalPesos(p))})`).catch(() => {});
+        await db.query('UPDATE contactos SET es_cliente = TRUE, hubspot_sincronizado = FALSE WHERE telefono = $1', [c.telefono]);
+        return { ok: true, mensaje: `Listo: ${etiquetaContacto(c)} quedó como ⭐ cliente y el negocio pasó a *Ganado*. Como es ${p.concepto} (no SAS), no le mandé el formulario de SAS: le dije que el asesor le indica los próximos pasos.` };
+    }
     await actualizarPresupuesto(p.id, { estado: 'pagado' });
     if (p.negocio_id) {
         await actualizarNegocio(p.negocio_id, { etapa: 'Ganado' }, `Pagó el presupuesto (${formatoPesos(p.total_ars || totalPesos(p))})`).catch(() => {});
@@ -1910,19 +2036,18 @@ async function registrarPago({ cliente }) {
 }
 
 
-// --- Presupuesto a medida (SRL, SA, otra jurisdicción…): se le pasa al asesor ---
-async function pedirCotizacionAsesor(telefono, { tramite = '', jurisdiccion = '', socios = null, detalle = '' } = {}) {
-    const clave = `cotizacion:${telefono}`;
-    const previa = await leerConfigJSON(clave, 2).catch(() => null);
-    if (previa && Date.now() - previa.creada < 24 * 3600000) return { ok: true, ya: true };
-    await guardarConfig(clave, JSON.stringify({ creada: Date.now(), tramite, jurisdiccion, socios }));
-    const c = await obtenerContacto(telefono);
-    const datos = [tramite && `Trámite: ${tramite}`, jurisdiccion && `Jurisdicción: ${jurisdiccion}`, socios && `Socios: ${socios}`].filter(Boolean).join(' · ');
-    await enviarAAdmin(`💼 ${etiquetaContacto(c || {}, 'Un cliente')} pide un presupuesto *a cotizar por vos*.\n${datos || 'Sin más datos.'}${detalle ? `\nDetalle: ${detalle}` : ''}\n\n` +
-        `Le dije que el asesor le prepara un presupuesto a medida y se lo envía por este medio. Para responderle: "escribile a ${c?.nombre || 'X'} …".`, { anotar: true });
-    const esp = ESPECIALIDADES.find(e => normalizarTexto(e) === normalizarTexto(tramite)) || null;
-    await abrirNegocio(telefono, { especialidad: esp, nota: `Pidió presupuesto: ${datos || tramite}` }).catch(() => {});
-    return { ok: true };
+// Primero la reunión: lo que se le dice al cliente cuando pide (o el modelo promete) un presupuesto.
+async function textoReunionPrimero(telefono) {
+    const vig = await turnosActivosCliente(telefono).catch(() => []);
+    if (vig.length) return `El presupuesto lo arma el asesor a medida, con lo que conversen en la reunión que ya tiene agendada (${etiquetaTurno(vig[0].inicio)}).`;
+    return 'Cada presupuesto se arma a medida, después de una breve reunión virtual sin cargo con el asesor (30 minutos por Google Meet), donde vemos los detalles de su caso. ¿Le ofrezco algunos horarios?';
+}
+// ¿Ya hay una cotización en marcha para esta persona (después de la reunión)?
+async function cotizacionEnCurso(telefono) {
+    const { rows: [p] } = await db.query(`SELECT 1 FROM presupuestos WHERE telefono = $1 AND estado IN ('borrador', 'confirmando', 'enviado') AND creado > NOW() - INTERVAL '30 days' LIMIT 1`, [telefono]).catch(() => ({ rows: [] }));
+    if (p) return true;
+    const pend = await leerConfigJSON('cotizar_pendiente', 1).catch(() => null);
+    return Boolean(pend && pend.telefono === telefono);
 }
 
 // Respuestas del modelo que no pueden salir así.
@@ -2167,9 +2292,11 @@ function construirInstrucciones() {
         '4. NUNCA des asesoramiento legal específico ni redactes contratos.\n' +
         '5. Nunca prometas que lo va a atender un abogado: decí siempre "un asesor del Estudio".\n' +
         '6. PRECIOS: NUNCA escribas precios, montos, rangos ni estimaciones, aunque insistan. ' +
-        'Si pide el precio o un presupuesto de una SAS, se lo preparamos: preguntá de a una (salteá lo que ya dijo) 1) si la sociedad va a estar en CABA, 2) cuántos socios van a ser, 3) si alguno de los socios es una empresa, 4) si alguno es extranjero y, en ese caso, si tiene CUIT o CUIL argentino, 5) si tiene una dirección en CABA para la sede (el Estudio no ofrece domicilio). Con eso usá preparar_presupuesto. ' +
+        'PRIMERO LA REUNIÓN: el Estudio arma cada presupuesto a medida DESPUÉS de una reunión virtual sin cargo (30 minutos por Google Meet) con el asesor. Si pide precio o presupuesto (SAS, SRL, SA, Asociación Civil u otro trámite), explicale eso con amabilidad y priorizá agendar la reunión (consultar_horarios). ' +
+        'Mientras tanto, sin convertirlo en un interrogatorio, juntá de a una pregunta los datos para la cotización (salteá lo que ya dijo): tipo de trámite, jurisdicción (CABA, Provincia de Buenos Aires u otra provincia), cuántos socios, si alguno es una empresa, si alguno es extranjero sin CUIT/CUIL argentino y si tiene dirección para la sede; guardalos con anotar_datos_cotizacion. ' +
+        'Si insiste en saber el precio sin reunión, explicale que sin conocer su caso no podemos cotizar con precisión y volvé a ofrecerle la reunión. NUNCA digas que le vamos a mandar un presupuesto: eso lo decide el asesor después de la reunión. ' +
         'Si pide los datos para transferir o pagar, usá pedir_datos_bancarios (nunca escribas un CBU o alias). Si dice que ya pagó, pedile que envíe el comprobante por acá. ' +
-        'Para otros trámites (SRL, SA, Asociación Civil, mantenimiento, etc.) o una SAS fuera de CABA, el asesor arma el presupuesto a medida: preguntá de a una qué tipo de trámite, en qué jurisdicción (CABA, Provincia de Buenos Aires u otra provincia) y cuántos socios, y usá pedir_cotizacion. Nunca digas que el asesor le va a mandar un presupuesto sin haber usado preparar_presupuesto o pedir_cotizacion. También podés ofrecerle la reunión sin cargo. Si pregunta por el mantenimiento o las actas después de constituir, decile que el Estudio ofrece tarifas especiales para la confección de actas, que cotiza el asesor.\n' +
+        'Si pregunta por el mantenimiento o las actas después de constituir, decile que el Estudio ofrece tarifas especiales para la confección de actas, que cotiza el asesor.\n' +
         '6b. JURISDICCIÓN: el Estudio trabaja en TODO el país: CABA (IGJ), Provincia de Buenos Aires (DPPJ) y las demás provincias, con gestión digital. NUNCA digas que el Estudio no hace trámites en alguna provincia o jurisdicción. Lo único que no hace son altas en Ingresos Brutos (AGIP/ARBA) y no ofrece domicilio legal.\n' +
         '7. Sé conciso: máximo 2 a 4 oraciones breves. Estás respondiendo por WhatsApp. Hacé UNA pregunta por mensaje.\n' +
         '8. Servicios del Estudio: constitución de sociedades, mantenimiento societario (balances, asambleas ordinarias y extraordinarias, cambio de autoridades y gerencias), transferencias y procesos de disolución y cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.\n' +
@@ -2267,35 +2394,19 @@ const HERRAMIENTAS_CLIENTE = [
         }
     },
     {
-        name: 'preparar_presupuesto',
-        description: 'Prepara el presupuesto de una SAS con las respuestas del cliente. El asesor lo revisa y se lo envía; vos NUNCA digas montos.',
+        name: 'anotar_datos_cotizacion',
+        description: 'Guarda los datos que el cliente fue dando para que el asesor cotice DESPUÉS de la reunión (tipo de trámite, jurisdicción, socios, etc.). No arma ningún presupuesto ni avisa a nadie. Usalo cada vez que dé alguno de estos datos.',
         parameters: {
             type: 'OBJECT',
             properties: {
-                tramite: { type: 'STRING', enum: ['SAS'] },
-                caba: { type: 'BOOLEAN', description: 'true si la sociedad va a estar en la Ciudad Autónoma de Buenos Aires.' },
+                tramite: { type: 'STRING', description: 'SAS, SRL, SA, Asociación Civil, Fundación u otro trámite (mantenimiento, transferencia, cierre…).' },
+                jurisdiccion: { type: 'STRING', description: 'CABA, Provincia de Buenos Aires u otra provincia.' },
                 socios: { type: 'INTEGER', description: 'Cantidad de socios.' },
-                socio_empresa: { type: 'BOOLEAN', description: 'true si algún socio es una empresa (persona jurídica), argentina o extranjera.' },
+                socio_empresa: { type: 'BOOLEAN', description: 'true si algún socio es una empresa (persona jurídica).' },
                 extranjero_sin_cuit: { type: 'BOOLEAN', description: 'true si algún socio es extranjero y NO tiene CUIT ni CUIL argentino.' },
-                sede_caba: { type: 'BOOLEAN', description: 'true si tiene una dirección en CABA para la sede social.' },
-                nombre_cliente: { type: 'STRING', description: 'Nombre y apellido, si todavía no lo tenemos.' }
-            },
-            required: ['tramite', 'caba', 'socios', 'socio_empresa', 'extranjero_sin_cuit', 'sede_caba']
-        }
-    },
-    {
-        name: 'pedir_cotizacion',
-        description: 'Pide al asesor un presupuesto a medida: SRL, SA, Asociación Civil, otros trámites, o una SAS fuera de CABA. Le avisa al asesor con los datos para que lo cotice. Vos NUNCA digas montos.',
-        parameters: {
-            type: 'OBJECT',
-            properties: {
-                tramite: { type: 'STRING', description: 'SRL, SA, SAS, Asociación Civil u otro trámite.' },
-                jurisdiccion: { type: 'STRING', description: 'CABA, Provincia de Buenos Aires u otra provincia (si la dijo).' },
-                socios: { type: 'INTEGER', description: 'Cantidad de socios, si la dijo.' },
-                detalle: { type: 'STRING', description: 'Otros datos útiles que dio (actividad, plazos, etc.).' },
-                nombre_cliente: { type: 'STRING', description: 'Nombre y apellido, si todavía no lo tenemos.' }
-            },
-            required: ['tramite']
+                sede: { type: 'BOOLEAN', description: 'true si tiene una dirección para la sede social en esa jurisdicción.' },
+                detalle: { type: 'STRING', description: 'Otros datos útiles (actividad, plazos…).' }
+            }
         }
     },
     {
@@ -2649,32 +2760,15 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             return { ok: true, indicacion: 'Decile que en un momento le enviamos los datos para la transferencia por este medio. NO escribas ningún dato bancario.' };
         }
 
-        if (nombre === 'pedir_cotizacion') {
-            if (!(contacto?.nombre && contacto.nombre !== 'No indicado')) {
-                const dado = limpiarNombre(args.nombre_cliente || '');
-                if (!dado) return { error: 'Antes de pedir el presupuesto, preguntale su nombre y apellido (y volvé a llamar con "nombre_cliente").' };
-                await db.query(`INSERT INTO contactos (telefono, nombre) VALUES ($1, $2) ON CONFLICT (telefono) DO UPDATE SET nombre = EXCLUDED.nombre`, [telefono, dado]);
-            }
-            const r = await pedirCotizacionAsesor(telefono, args);
-            return { ok: true, presupuesto_gestionado: true, indicacion: r.ya ? 'Ya le pasamos el pedido al asesor: decile que se lo envía a la brevedad por este medio. No digas montos.'
-                : 'Decile que ya le pasamos los datos al asesor, que le prepara un presupuesto a medida y se lo envía a la brevedad por este medio. NO digas montos. Si quiere, también puede tener una reunión sin cargo.' };
-        }
-
-        if (nombre === 'preparar_presupuesto') {
-            if (args.tramite !== 'SAS') return { error: 'Por ahora el presupuesto automático es solo para SAS. Para este trámite ofrecé la reunión sin cargo.' };
-            let ficha = contacto;
-            if (!(ficha?.nombre && ficha.nombre !== 'No indicado')) {
-                const dado = limpiarNombre(args.nombre_cliente || '');
-                if (!dado) return { error: 'Antes de preparar el presupuesto, preguntale su nombre y apellido (y volvé a llamar con "nombre_cliente").' };
-                await db.query(`INSERT INTO contactos (telefono, nombre) VALUES ($1, $2) ON CONFLICT (telefono) DO UPDATE SET nombre = EXCLUDED.nombre`, [telefono, dado]);
-            }
-            const faltan = ['caba', 'socios', 'socio_empresa', 'extranjero_sin_cuit', 'sede_caba'].filter(k => args[k] === undefined || args[k] === null);
-            if (faltan.length) return { error: `Todavía falta preguntarle: ${faltan.join(', ')}. Preguntá de a una.` };
-            const { rows: [ya] } = await db.query(`SELECT id FROM presupuestos WHERE telefono = $1 AND estado IN ('borrador', 'confirmando') AND creado > NOW() - INTERVAL '1 day'`, [telefono]);
-            if (ya) return { ok: true, ya_en_preparacion: true, presupuesto_gestionado: true, indicacion: 'Ya le estamos preparando el presupuesto: decile que el asesor se lo envía a la brevedad. No digas montos.' };
-            const p = await crearPresupuesto(telefono, args);
-            await enviarAAdmin(await iniciarConfirmacion(p), { anotar: true });
-            return { ok: true, en_preparacion: true, presupuesto_gestionado: true, indicacion: `Decile que con esos datos el asesor le prepara el presupuesto y se lo envía a la brevedad por este medio. NO digas ningún monto.${args.sede_caba === false ? ' Avisale con amabilidad que para constituir la SAS en CABA hace falta una dirección en CABA para la sede, y que el Estudio no ofrece domicilio.' : ''}` };
+        if (nombre === 'anotar_datos_cotizacion' || nombre === 'preparar_presupuesto' || nombre === 'pedir_cotizacion') {
+            const d = await anotarDatosCotizacion(telefono, args);
+            const vig = await turnosActivosCliente(telefono);
+            const sinSede = d.tramite === 'SAS' && tipoJurisdiccion(d.jurisdiccion) === 'CABA' && d.sede === false;
+            return { ok: true, datos_guardados: true, indicacion:
+                (vig.length ? 'Datos guardados. Decile que el asesor le arma el presupuesto a medida con lo que conversen en la reunión que ya tiene agendada.'
+                    : 'Datos guardados. Decile que el presupuesto lo arma el asesor a medida después de una reunión virtual sin cargo de 30 minutos por Google Meet, y ofrecele horarios (consultar_horarios).') +
+                ' NO digas montos ni que le van a mandar un presupuesto ahora.' +
+                (sinSede ? ' Avisale con amabilidad que para constituir la SAS en CABA hace falta una dirección en CABA para la sede, y que el Estudio no ofrece domicilio.' : '') };
         }
 
         if (nombre === 'derivar_consulta') {
@@ -2945,6 +3039,9 @@ async function contextoCliente(telefono) {
         if (esperando) partes.push(`El asesor le escribió hace poco: «${esperando.mensaje}».`);
         const evaluacion = await leerConfigJSON(`evaluacion:${telefono}`, 7);
         if (evaluacion) partes.push(`Su consulta sobre ${evaluacion.area} está en evaluación por el asesor (${evaluacion.resumen}). No ofrezcas horarios para ese tema: el asesor lo contacta.`);
+        const datosCot = resumenDatosCotizacion(await leerDatosCotizacion(telefono));
+        if (datosCot) partes.push(`Datos para la cotización que ya dio (no los vuelvas a preguntar): ${datosCot}.`);
+        if (await cotizacionEnCurso(telefono)) partes.push('Después de la reunión el asesor está preparando su presupuesto: si pregunta, decile que se lo envía a la brevedad por este medio.');
         const ofrecidas = await leerOpcionesOfrecidas(telefono);
         if (ofrecidas) partes.push(`Últimas opciones ofrecidas (si elige una, usá solicitar_turno con ese número en "opcion"):\n${ofrecidas.opciones.map((o, i) => `${i + 1}. ${o.texto}`).join('\n')}`);
     } catch (e) { /* sin contexto de turnos */ }
@@ -3283,18 +3380,17 @@ async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = 
     if (silencio) return '';
     if (reply && REGEX_MONTO.test(reply)) {
         console.warn('El modelo escribió un monto; se reemplaza.');
-        return 'Los valores dependen de cada caso: el asesor le prepara un presupuesto a medida y se lo envía por este medio. Si es una SAS, con unos pocos datos se lo armamos.';
+        return textoReunionPrimero(remitenteId);
     }
     if (reply && REGEX_NO_HACEMOS.test(reply) && !EXCEPCIONES_NO_HACEMOS.test(reply)) {
-        // Dice que el Estudio no hace un trámite o no trabaja en una jurisdicción: es falso, se corrige y se le pasa al asesor.
+        // Dice que el Estudio no hace un trámite o no trabaja en una jurisdicción: es falso, se corrige y se ofrece la reunión.
         console.warn('El modelo dijo que el Estudio no hace un trámite; se corrige.');
-        await pedirCotizacionAsesor(remitenteId, { detalle: `Consulta del cliente: «${String(mensajeTexto).slice(0, 200)}»` }).catch(() => {});
-        return 'Sí, el Estudio trabaja en todo el país, también en la Provincia de Buenos Aires y en el resto de las provincias. Ya le pasamos sus datos al asesor, que le prepara un presupuesto a medida y se lo envía a la brevedad por este medio.';
+        return 'Sí, el Estudio trabaja en todo el país, también en la Provincia de Buenos Aires y en el resto de las provincias. ' + await textoReunionPrimero(remitenteId);
     }
-    if (reply && !presupuestoGestionado && REGEX_PROMETE_PRESUPUESTO.test(reply)) {
-        // Prometió un presupuesto sin pedirlo: se le avisa al asesor para que la promesa se cumpla.
-        console.warn('El modelo prometió un presupuesto sin pedirlo; se le avisa al asesor.');
-        await pedirCotizacionAsesor(remitenteId, { detalle: `El bot le dijo que le enviamos un presupuesto. Último mensaje del cliente: «${String(mensajeTexto).slice(0, 200)}»` }).catch(() => {});
+    if (reply && !presupuestoGestionado && REGEX_PROMETE_PRESUPUESTO.test(reply) && !/reuni[oó]n/i.test(reply) && !(await cotizacionEnCurso(remitenteId))) {
+        // Prometió mandarle un presupuesto: primero va la reunión.
+        console.warn('El modelo prometió un presupuesto antes de la reunión; se corrige.');
+        return textoReunionPrimero(remitenteId);
     }
     if (reply && !temaAgregado && REGEX_DICE_AGREGADO.test(reply)) {
         // Dice que sumó un tema que nunca se sumó: se corrige con la pregunta que corresponde.
@@ -3570,13 +3666,15 @@ const HERRAMIENTAS_ADMIN = [
             nota: { type: 'STRING', description: 'Detalle breve que haya dado el administrador (opcional).' } }, required: ['resultado'] }
     },
     {
-        name: 'armar_presupuesto', description: 'Arma un presupuesto de SAS para un cliente (con la tabla de precios) y arranca las 3 confirmaciones antes de enviarlo.',
+        name: 'armar_presupuesto', description: 'Arma un presupuesto (cualquier trámite) para un cliente cuando el administrador lo pide ("cotizale a X"). Usa los datos que juntó el bot más los que diga el administrador; el total lo pone el administrador y se envía con 3 confirmaciones.',
         parameters: { type: 'OBJECT', properties: {
             cliente: { type: 'STRING', description: 'Nombre o teléfono.' },
+            tramite: { type: 'STRING', description: 'SAS, SRL, SA, Asociación Civil u otro trámite.' },
+            jurisdiccion: { type: 'STRING', description: 'CABA, Provincia de Buenos Aires u otra provincia.' },
             socios: { type: 'INTEGER' },
-            caba: { type: 'BOOLEAN', description: 'false si no es en CABA (queda a cotizar).' },
             socio_empresa: { type: 'BOOLEAN' },
-            extranjero_sin_cuit: { type: 'BOOLEAN' } }, required: ['cliente', 'socios'] }
+            extranjero_sin_cuit: { type: 'BOOLEAN' },
+            sede: { type: 'BOOLEAN' } }, required: ['cliente'] }
     },
     {
         name: 'retomar_presupuesto', description: 'Vuelve a mostrar un presupuesto que quedó en espera para confirmarlo y enviarlo ("mandale el presupuesto a X").',
@@ -3775,7 +3873,7 @@ async function instruccionesAdmin() {
         'SEGUIMIENTO (HubSpot): cuando te diga cómo siguió una persona usá resultado_negocio: "asistió" / "no vino" → asistio / no_asistio; "le mandé la propuesta" → propuesta_enviada; "contrató", "cerramos", "pagó" → ganado (además lo marca como cliente); "no siguió", "no le interesa", "lo perdimos" → perdido. Si la reunión tiene número, pasalo en turno_id.\n' +
         'Para cargar o cambiar datos el administrador escribe "datos bancarios: …", "formulario sas: …" o "reseñas: <link>" (eso lo guarda el sistema solo). Si te pide cambiar los datos bancarios sin pasarlos, explicale que mande "datos bancarios: Banco … · Titular … · CBU … · Alias …". Nunca digas que no se pueden cambiar.\n' +
         'Si te dice que la sociedad de un cliente quedó inscripta ("X inscripta", "salió la SAS de X"), usá registrar_inscripcion: el sistema pregunta si se le pide la reseña en Google. Para pedir una reseña usá SOLO pedir_resena; nunca digas que pediste o enviaste una reseña si la herramienta no lo confirmó.\n' +
-        'PRESUPUESTOS: "cotizale a X una SAS con N socios" → armar_presupuesto; "mandale el presupuesto a X" → retomar_presupuesto; "X pagó" → registrar_pago; "X inscripta" → registrar_inscripcion. El envío del presupuesto lo maneja el sistema con 3 confirmaciones: vos nunca digas que lo enviaste.\n' +
+        'PRESUPUESTOS: se cotiza DESPUÉS de la reunión (cuando el administrador dice que asistió, el sistema pregunta si se cotiza). "cotizale a X …" → armar_presupuesto (el total lo pone el administrador); "mandale el presupuesto a X" → retomar_presupuesto; "X pagó" → registrar_pago; "X inscripta" → registrar_inscripcion. El envío del presupuesto lo maneja el sistema con 3 confirmaciones: vos nunca digas que lo enviaste.\n' +
         'Si te dice "no le escribas más a X" (o que no le mandes más seguimientos), usá detener_seguimiento.\n' +
         'Si te pide reiniciar, resetear o borrar a una persona para probar ("que el bot crea que es nuevo"), usá reiniciar_contacto con ESA persona. Nunca reinicies a varias juntas ni a alguien que no nombró.\n' +
         'HORAS: usá solo una hora que haya dicho el administrador o el cliente (por ejemplo "a las 17:15"). Si dicen "después de la otra reunión" o algo sin hora, preguntá a qué hora, indicando a qué hora termina la reunión actual. Nunca elijas una hora por tu cuenta.\n' +
@@ -3803,7 +3901,9 @@ function recordarEnHistorialAdmin(textoAdmin, respuesta) {
     historialAdmin = [...historialAdmin, { role: 'user', parts: [{ text: textoAdmin }] }, { role: 'model', parts: [{ text: respuesta }] }].slice(-12);
 }
 
+let contadorAdmin = 0; // cuenta los mensajes del administrador (para respuestas que valen solo en el mensaje siguiente)
 async function procesarMensajeAdmin(sock, sender, text) {
+    contadorAdmin++;
     const responder = async (t) => {
         await sock.sendMessage(sender, { text: t });
         recordarEnHistorialAdmin(text, t);
@@ -3824,6 +3924,10 @@ async function procesarMensajeAdmin(sock, sender, text) {
     // 0c) Pedido de reseña después de "X inscripta": sí / no.
     const rResena = await respuestaResena(text).catch(e => { console.error('Reseña:', e.message); return null; });
     if (rResena) return responder(rResena);
+
+    // 0d) Después de "asistió": ¿le cotizamos? sí / no.
+    const rCotizar = await respuestaCotizar(text).catch(e => { console.error('Cotizar:', e.message); return null; });
+    if (rCotizar) return responder(rCotizar);
 
     // 1) Respuesta a una acción que quedó esperando confirmación.
     const pendiente = await leerAccionPendiente();
@@ -4448,7 +4552,8 @@ async function registrarResultado({ cliente, turno_id, resultado, nota }) {
         extra = ' Además quedó marcado como ⭐ cliente.';
     }
     const c = await obtenerContacto(telefono);
-    return { ok: true, mensaje: `Listo, ${etiquetaContacto(c || {}, 'el cliente')}: "${g.titulo}" pasó a *${etapa}*.${extra}${extraSeg}${HUBSPOT_TOKEN ? '' : ' (HubSpot todavía no está conectado: queda guardado y se envía cuando cargues HUBSPOT_TOKEN.)'}` };
+    const oferta = resultado === 'asistio' ? await ofrecerCotizacion(telefono, g).catch(e => { console.error('Ofrecer cotización:', e.message); return null; }) : null;
+    return { ok: true, mensaje: `Listo, ${etiquetaContacto(c || {}, 'el cliente')}: "${g.titulo}" pasó a *${etapa}*.${extra}${extraSeg}${HUBSPOT_TOKEN ? '' : ' (HubSpot todavía no está conectado: queda guardado y se envía cuando cargues HUBSPOT_TOKEN.)'}${oferta ? `\n\n${oferta}` : ''}` };
 }
 
 // Reuniones que ya terminaron y esperan que digas si la persona asistió.
@@ -4930,7 +5035,7 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, formularioCompletado, procesarArchivoCliente, comandoConfiguracionAdmin, registrarInscripcion, respuestaResena, pedirResena, pedirCotizacionAsesor, REGEX_DATOS_BANCO, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, formularioCompletado, procesarArchivoCliente, comandoConfiguracionAdmin, registrarInscripcion, respuestaResena, pedirResena, respuestaCotizar, ofrecerCotizacion, anotarDatosCotizacion, leerDatosCotizacion, normalizarTramite, tipoJurisdiccion, REGEX_DATOS_BANCO, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
