@@ -1910,6 +1910,26 @@ async function registrarPago({ cliente }) {
 }
 
 
+// --- Presupuesto a medida (SRL, SA, otra jurisdicción…): se le pasa al asesor ---
+async function pedirCotizacionAsesor(telefono, { tramite = '', jurisdiccion = '', socios = null, detalle = '' } = {}) {
+    const clave = `cotizacion:${telefono}`;
+    const previa = await leerConfigJSON(clave, 2).catch(() => null);
+    if (previa && Date.now() - previa.creada < 24 * 3600000) return { ok: true, ya: true };
+    await guardarConfig(clave, JSON.stringify({ creada: Date.now(), tramite, jurisdiccion, socios }));
+    const c = await obtenerContacto(telefono);
+    const datos = [tramite && `Trámite: ${tramite}`, jurisdiccion && `Jurisdicción: ${jurisdiccion}`, socios && `Socios: ${socios}`].filter(Boolean).join(' · ');
+    await enviarAAdmin(`💼 ${etiquetaContacto(c || {}, 'Un cliente')} pide un presupuesto *a cotizar por vos*.\n${datos || 'Sin más datos.'}${detalle ? `\nDetalle: ${detalle}` : ''}\n\n` +
+        `Le dije que el asesor le prepara un presupuesto a medida y se lo envía por este medio. Para responderle: "escribile a ${c?.nombre || 'X'} …".`, { anotar: true });
+    const esp = ESPECIALIDADES.find(e => normalizarTexto(e) === normalizarTexto(tramite)) || null;
+    await abrirNegocio(telefono, { especialidad: esp, nota: `Pidió presupuesto: ${datos || tramite}` }).catch(() => {});
+    return { ok: true };
+}
+
+// Respuestas del modelo que no pueden salir así.
+const REGEX_NO_HACEMOS = /\bno\s+(realizamos|hacemos|trabajamos|atendemos|gestionamos|tramitamos|ofrecemos|podemos\s+(realizar|hacer|tramitar|gestionar))\b[^.?!]{0,90}\b(provincia|jurisdicci|interior|tr[aá]mites?|constituci|sociedad|srl|sas|s\.?a\.?\b)/i;
+const EXCEPCIONES_NO_HACEMOS = /ingresos brutos|agip|arba|domicilio|escriban|penal|familia|accidente|laboral|divorcio/i;
+const REGEX_PROMETE_PRESUPUESTO = /(prepar(ar[áa]|a|amos)|envi(ar[áa]|a|amos)|mand(ar[áa]|a|amos)|arm(ar[áa]|a|amos)|har[áa] llegar)[^.?!]{0,50}presupuesto|presupuesto[^.?!]{0,60}(se lo (envi|mand)|le (llegar|envi|mand))/i;
+
 // --- Sociedad inscripta y pedido de reseña en Google ---
 const RESENAS_URL_INICIAL = 'https://g.page/r/CSAa5VOT97H3EBM/review';
 
@@ -2149,7 +2169,8 @@ function construirInstrucciones() {
         '6. PRECIOS: NUNCA escribas precios, montos, rangos ni estimaciones, aunque insistan. ' +
         'Si pide el precio o un presupuesto de una SAS, se lo preparamos: preguntá de a una (salteá lo que ya dijo) 1) si la sociedad va a estar en CABA, 2) cuántos socios van a ser, 3) si alguno de los socios es una empresa, 4) si alguno es extranjero y, en ese caso, si tiene CUIT o CUIL argentino, 5) si tiene una dirección en CABA para la sede (el Estudio no ofrece domicilio). Con eso usá preparar_presupuesto. ' +
         'Si pide los datos para transferir o pagar, usá pedir_datos_bancarios (nunca escribas un CBU o alias). Si dice que ya pagó, pedile que envíe el comprobante por acá. ' +
-        'Para otros trámites (SRL, SA, mantenimiento, etc.) explicá que el valor depende del caso y que en la reunión el asesor arma una propuesta a medida. Si pregunta por el mantenimiento o las actas después de constituir, decile que el Estudio ofrece tarifas especiales para la confección de actas, que cotiza el asesor.\n' +
+        'Para otros trámites (SRL, SA, Asociación Civil, mantenimiento, etc.) o una SAS fuera de CABA, el asesor arma el presupuesto a medida: preguntá de a una qué tipo de trámite, en qué jurisdicción (CABA, Provincia de Buenos Aires u otra provincia) y cuántos socios, y usá pedir_cotizacion. Nunca digas que el asesor le va a mandar un presupuesto sin haber usado preparar_presupuesto o pedir_cotizacion. También podés ofrecerle la reunión sin cargo. Si pregunta por el mantenimiento o las actas después de constituir, decile que el Estudio ofrece tarifas especiales para la confección de actas, que cotiza el asesor.\n' +
+        '6b. JURISDICCIÓN: el Estudio trabaja en TODO el país: CABA (IGJ), Provincia de Buenos Aires (DPPJ) y las demás provincias, con gestión digital. NUNCA digas que el Estudio no hace trámites en alguna provincia o jurisdicción. Lo único que no hace son altas en Ingresos Brutos (AGIP/ARBA) y no ofrece domicilio legal.\n' +
         '7. Sé conciso: máximo 2 a 4 oraciones breves. Estás respondiendo por WhatsApp. Hacé UNA pregunta por mensaje.\n' +
         '8. Servicios del Estudio: constitución de sociedades, mantenimiento societario (balances, asambleas ordinarias y extraordinarias, cambio de autoridades y gerencias), transferencias y procesos de disolución y cierre para SAS, SRL, SA, Asociaciones Civiles y ONGs.\n' +
         'PERFIL COMERCIAL (muy importante): tu objetivo es que el cliente quiera trabajar con el Estudio y llegue a la reunión interesado, sin presionarlo.\n' +
@@ -2260,6 +2281,21 @@ const HERRAMIENTAS_CLIENTE = [
                 nombre_cliente: { type: 'STRING', description: 'Nombre y apellido, si todavía no lo tenemos.' }
             },
             required: ['tramite', 'caba', 'socios', 'socio_empresa', 'extranjero_sin_cuit', 'sede_caba']
+        }
+    },
+    {
+        name: 'pedir_cotizacion',
+        description: 'Pide al asesor un presupuesto a medida: SRL, SA, Asociación Civil, otros trámites, o una SAS fuera de CABA. Le avisa al asesor con los datos para que lo cotice. Vos NUNCA digas montos.',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                tramite: { type: 'STRING', description: 'SRL, SA, SAS, Asociación Civil u otro trámite.' },
+                jurisdiccion: { type: 'STRING', description: 'CABA, Provincia de Buenos Aires u otra provincia (si la dijo).' },
+                socios: { type: 'INTEGER', description: 'Cantidad de socios, si la dijo.' },
+                detalle: { type: 'STRING', description: 'Otros datos útiles que dio (actividad, plazos, etc.).' },
+                nombre_cliente: { type: 'STRING', description: 'Nombre y apellido, si todavía no lo tenemos.' }
+            },
+            required: ['tramite']
         }
     },
     {
@@ -2613,6 +2649,17 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             return { ok: true, indicacion: 'Decile que en un momento le enviamos los datos para la transferencia por este medio. NO escribas ningún dato bancario.' };
         }
 
+        if (nombre === 'pedir_cotizacion') {
+            if (!(contacto?.nombre && contacto.nombre !== 'No indicado')) {
+                const dado = limpiarNombre(args.nombre_cliente || '');
+                if (!dado) return { error: 'Antes de pedir el presupuesto, preguntale su nombre y apellido (y volvé a llamar con "nombre_cliente").' };
+                await db.query(`INSERT INTO contactos (telefono, nombre) VALUES ($1, $2) ON CONFLICT (telefono) DO UPDATE SET nombre = EXCLUDED.nombre`, [telefono, dado]);
+            }
+            const r = await pedirCotizacionAsesor(telefono, args);
+            return { ok: true, presupuesto_gestionado: true, indicacion: r.ya ? 'Ya le pasamos el pedido al asesor: decile que se lo envía a la brevedad por este medio. No digas montos.'
+                : 'Decile que ya le pasamos los datos al asesor, que le prepara un presupuesto a medida y se lo envía a la brevedad por este medio. NO digas montos. Si quiere, también puede tener una reunión sin cargo.' };
+        }
+
         if (nombre === 'preparar_presupuesto') {
             if (args.tramite !== 'SAS') return { error: 'Por ahora el presupuesto automático es solo para SAS. Para este trámite ofrecé la reunión sin cargo.' };
             let ficha = contacto;
@@ -2624,10 +2671,10 @@ async function ejecutarHerramientaCliente(telefono, nombre, args) {
             const faltan = ['caba', 'socios', 'socio_empresa', 'extranjero_sin_cuit', 'sede_caba'].filter(k => args[k] === undefined || args[k] === null);
             if (faltan.length) return { error: `Todavía falta preguntarle: ${faltan.join(', ')}. Preguntá de a una.` };
             const { rows: [ya] } = await db.query(`SELECT id FROM presupuestos WHERE telefono = $1 AND estado IN ('borrador', 'confirmando') AND creado > NOW() - INTERVAL '1 day'`, [telefono]);
-            if (ya) return { ok: true, ya_en_preparacion: true, indicacion: 'Ya le estamos preparando el presupuesto: decile que el asesor se lo envía a la brevedad. No digas montos.' };
+            if (ya) return { ok: true, ya_en_preparacion: true, presupuesto_gestionado: true, indicacion: 'Ya le estamos preparando el presupuesto: decile que el asesor se lo envía a la brevedad. No digas montos.' };
             const p = await crearPresupuesto(telefono, args);
             await enviarAAdmin(await iniciarConfirmacion(p), { anotar: true });
-            return { ok: true, en_preparacion: true, indicacion: `Decile que con esos datos el asesor le prepara el presupuesto y se lo envía a la brevedad por este medio. NO digas ningún monto.${args.sede_caba === false ? ' Avisale con amabilidad que para constituir la SAS en CABA hace falta una dirección en CABA para la sede, y que el Estudio no ofrece domicilio.' : ''}` };
+            return { ok: true, en_preparacion: true, presupuesto_gestionado: true, indicacion: `Decile que con esos datos el asesor le prepara el presupuesto y se lo envía a la brevedad por este medio. NO digas ningún monto.${args.sede_caba === false ? ' Avisale con amabilidad que para constituir la SAS en CABA hace falta una dirección en CABA para la sede, y que el Estudio no ofrece domicilio.' : ''}` };
         }
 
         if (nombre === 'derivar_consulta') {
@@ -3220,6 +3267,7 @@ async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = 
     const instrucciones = construirInstrucciones() + '\n\nCONTEXTO ACTUAL:\n' + await contextoCliente(remitenteId);
     let silencio = false; // una herramienta ya le respondió al cliente: no se agrega texto del modelo
     let temaAgregado = false;
+    let presupuestoGestionado = false;
     const reply = await conversarConHerramientas({
         instrucciones,
         contents: [...base, mensajeUsuario],
@@ -3227,6 +3275,7 @@ async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = 
         ejecutar: async (nombre, args) => {
             const r = await ejecutarHerramientaCliente(remitenteId, nombre, args);
             if (r?.tema_agregado) temaAgregado = true;
+            if (r?.presupuesto_gestionado) presupuestoGestionado = true;
             if (r && r._silencio) { silencio = true; const { _silencio, ...resto } = r; return resto; }
             return r;
         }
@@ -3235,6 +3284,17 @@ async function consultarGemini(remitenteId, mensajeTexto, { respuestaAlAsesor = 
     if (reply && REGEX_MONTO.test(reply)) {
         console.warn('El modelo escribió un monto; se reemplaza.');
         return 'Los valores dependen de cada caso: el asesor le prepara un presupuesto a medida y se lo envía por este medio. Si es una SAS, con unos pocos datos se lo armamos.';
+    }
+    if (reply && REGEX_NO_HACEMOS.test(reply) && !EXCEPCIONES_NO_HACEMOS.test(reply)) {
+        // Dice que el Estudio no hace un trámite o no trabaja en una jurisdicción: es falso, se corrige y se le pasa al asesor.
+        console.warn('El modelo dijo que el Estudio no hace un trámite; se corrige.');
+        await pedirCotizacionAsesor(remitenteId, { detalle: `Consulta del cliente: «${String(mensajeTexto).slice(0, 200)}»` }).catch(() => {});
+        return 'Sí, el Estudio trabaja en todo el país, también en la Provincia de Buenos Aires y en el resto de las provincias. Ya le pasamos sus datos al asesor, que le prepara un presupuesto a medida y se lo envía a la brevedad por este medio.';
+    }
+    if (reply && !presupuestoGestionado && REGEX_PROMETE_PRESUPUESTO.test(reply)) {
+        // Prometió un presupuesto sin pedirlo: se le avisa al asesor para que la promesa se cumpla.
+        console.warn('El modelo prometió un presupuesto sin pedirlo; se le avisa al asesor.');
+        await pedirCotizacionAsesor(remitenteId, { detalle: `El bot le dijo que le enviamos un presupuesto. Último mensaje del cliente: «${String(mensajeTexto).slice(0, 200)}»` }).catch(() => {});
     }
     if (reply && !temaAgregado && REGEX_DICE_AGREGADO.test(reply)) {
         // Dice que sumó un tema que nunca se sumó: se corrige con la pregunta que corresponde.
@@ -4870,7 +4930,7 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, formularioCompletado, procesarArchivoCliente, comandoConfiguracionAdmin, registrarInscripcion, respuestaResena, pedirResena, REGEX_DATOS_BANCO, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, formularioCompletado, procesarArchivoCliente, comandoConfiguracionAdmin, registrarInscripcion, respuestaResena, pedirResena, pedirCotizacionAsesor, REGEX_DATOS_BANCO, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
