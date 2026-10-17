@@ -258,6 +258,8 @@ async function inicializarDB() {
         await db.query(`ALTER TABLE negocios ADD COLUMN IF NOT EXISTS monto_usd NUMERIC`);
         await db.query(`ALTER TABLE presupuestos ADD COLUMN IF NOT EXISTS token_formulario TEXT`);
         await db.query(`ALTER TABLE presupuestos ADD COLUMN IF NOT EXISTS formulario_completado_en TIMESTAMPTZ`);
+        await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS inscripta_en TIMESTAMPTZ`);
+        await db.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS resena_pedida_en TIMESTAMPTZ`);
         await db.query(`CREATE TABLE IF NOT EXISTS eventos_negocio (id SERIAL PRIMARY KEY, negocio_id INTEGER, telefono TEXT, etapa TEXT, creado TIMESTAMPTZ DEFAULT NOW())`);
         await db.query(`
             CREATE TABLE IF NOT EXISTS seguimientos (
@@ -1904,9 +1906,55 @@ async function registrarPago({ cliente }) {
         await actualizarNegocio(p.negocio_id, { etapa: 'Ganado' }, `Pagó el presupuesto (${formatoPesos(p.total_ars || totalPesos(p))})`).catch(() => {});
     }
     await db.query('UPDATE contactos SET es_cliente = TRUE, hubspot_sincronizado = FALSE WHERE telefono = $1', [c.telefono]);
-    return { ok: true, mensaje: `Listo: ${etiquetaContacto(c)} quedó como ⭐ cliente, el negocio pasó a *Ganado* y le mandé el formulario de datos${link ? ' (Google Forms). Cuando lo complete te aviso.' : ` para que lo envíe a ${CORREO_DATOS_SAS}. (Tip: cargá el formulario online con "formulario sas: …").`}` };
+    return { ok: true, mensaje: `Listo: ${etiquetaContacto(c)} quedó como ⭐ cliente, el negocio pasó a *Ganado* y le mandé el formulario de datos${link ? ' (Google Forms). Cuando lo complete te aviso. Cuando salga la inscripción, decime "' + (c.nombre || 'X') + ' inscripta".' : ` para que lo envíe a ${CORREO_DATOS_SAS}. (Tip: cargá el formulario online con "formulario sas: …").`}` };
 }
 
+
+// --- Sociedad inscripta y pedido de reseña en Google ---
+const RESENAS_URL_INICIAL = 'https://g.page/r/CSAa5VOT97H3EBM/review';
+
+function textoPedidoResena(link) {
+    return '¡Felicitaciones, su sociedad ya está inscripta! 🎉 Fue un gusto acompañarlo en el trámite.\n\n' +
+        `Si quedó conforme con nuestro trabajo, nos ayudaría mucho que nos deje su opinión en Google:\n👉 ${link}\n\n¡Muchas gracias!`;
+}
+
+async function registrarInscripcion({ cliente }) {
+    const c = await buscarContacto(cliente);
+    if (c.error) return { ok: false, mensaje: c.error };
+    const quien = etiquetaContacto(c);
+    await db.query('UPDATE contactos SET inscripta_en = COALESCE(inscripta_en, NOW()), es_cliente = TRUE, hubspot_sincronizado = FALSE WHERE telefono = $1', [c.telefono]);
+    const { rows: [p] } = await db.query(`SELECT * FROM presupuestos WHERE telefono = $1 AND negocio_id IS NOT NULL ORDER BY id DESC LIMIT 1`, [c.telefono]);
+    if (p?.negocio_id) await actualizarNegocio(p.negocio_id, { etapa: 'Ganado' }, 'Sociedad inscripta').catch(() => {});
+    const { rows: [f] } = await db.query('SELECT resena_pedida_en FROM contactos WHERE telefono = $1', [c.telefono]);
+    if (f?.resena_pedida_en) return { ok: true, mensaje: `✅ Anoté que la sociedad de ${quien} quedó inscripta. La reseña ya se la pedí el ${formatoFecha(new Date(f.resena_pedida_en))}, así que no se la vuelvo a pedir.` };
+    const { rows: [det] } = await db.query(`SELECT 1 FROM seguimientos WHERE telefono = $1 AND estado = 'detenido' LIMIT 1`, [c.telefono]);
+    if (det) return { ok: true, mensaje: `✅ Anoté que la sociedad de ${quien} quedó inscripta. No le pido reseña porque me dijiste que no le escriba más.` };
+    await guardarConfig('resena_pendiente', JSON.stringify({ telefono: c.telefono, creada: Date.now() }));
+    return { ok: true, mensaje: `✅ Anoté que la sociedad de ${quien} quedó inscripta (negocio en *Ganado*).\n\n⭐ ¿Le pido una reseña en Google? Respondé *sí* o *no*.` };
+}
+
+async function respuestaResena(texto) {
+    const pend = await leerConfigJSON('resena_pendiente', 1);
+    if (!pend || Date.now() - pend.creada > 2 * 3600000) return null;
+    const t = normalizarTexto(texto);
+    if (/^(no|no gracias|todavia no|despues|no le pidas|no se la pidas|cancelar)$/.test(t)) {
+        await borrarConfig('resena_pendiente');
+        return 'Listo, no le pido la reseña. 👍';
+    }
+    if (!/^(si|sii|ok|dale|pedisela|pedile|si pedisela|si pedile|si dale|enviar|mandale|confirmo)$/.test(t)) return null;
+    const c = await obtenerContacto(pend.telefono);
+    const link = (await leerConfig('resenas_url')) || RESENAS_URL_INICIAL;
+    try {
+        await enviarACliente(pend.telefono, textoPedidoResena(link));
+    } catch (e) {
+        return `No pude enviarle el mensaje por WhatsApp (${e.message}). Probá de nuevo respondiendo *sí*.`;
+    }
+    await db.query('UPDATE contactos SET resena_pedida_en = NOW() WHERE telefono = $1', [pend.telefono]);
+    await borrarConfig('resena_pendiente');
+    const { rows: [p] } = await db.query(`SELECT negocio_id FROM presupuestos WHERE telefono = $1 AND negocio_id IS NOT NULL ORDER BY id DESC LIMIT 1`, [pend.telefono]);
+    if (p?.negocio_id) await actualizarNegocio(p.negocio_id, {}, 'Se le pidió una reseña en Google').catch(() => {});
+    return `⭐ Listo, le pedí la reseña a ${etiquetaContacto(c || {}, 'el cliente')}. No se la vuelvo a pedir.`;
+}
 
 // --- Formulario de datos (Google Forms) y datos bancarios ---
 
@@ -1937,6 +1985,9 @@ async function formularioCompletado(token) {
     return true;
 }
 
+// Reconoce CBU / CVU / alias (también escritos "C.B.U.").
+const REGEX_DATOS_BANCO = /(^|[^a-z])(c\.?\s?b\.?\s?u|c\.?\s?v\.?\s?u|alias)(\.|[^a-z]|$)/i;
+
 // Datos bancarios: el cliente los pide y el administrador confirma cuáles se envían.
 async function pedirDatosBancarios(telefono) {
     const c = await obtenerContacto(telefono);
@@ -1959,7 +2010,7 @@ async function respuestaDatosBancarios(texto) {
     } else if (/^(no|cancelar|cancela|no le envies|no le mandes)$/.test(t)) {
         await borrarConfig('banco_pendiente');
         return 'Listo, no le envío los datos bancarios. 👍';
-    } else if (/\b(cbu|cvu|alias)\b/i.test(texto)) {
+    } else if (REGEX_DATOS_BANCO.test(texto)) {
         datos = String(texto).trim();
     } else return null;
     const c = await obtenerContacto(pend.telefono);
@@ -1988,16 +2039,40 @@ async function comandoConfiguracionAdmin(texto) {
             ? '✅ Guardé el formulario de la SAS. Cuando un cliente pague, le mando el link con su nombre y su código ya cargados.'
             : '✅ Guardé el formulario. Ojo: ese link no tiene el código de referencia precargado, así que no voy a poder avisarte quién lo completó. Usá el link que muestra el script (el que tiene REFERENCIA).';
     }
-    const mBanco = String(texto).match(/^\s*datos\s+bancarios\s*:\s*([\s\S]+)/i);
-    if (mBanco) {
+    // "datos bancarios: …", también "cambiar/actualizar/nuevos datos bancarios", en negrita, sin dos puntos o con los datos abajo.
+    const limpio = String(texto).replace(/[*_~]/g, '').trim();
+    const mBanco = limpio.match(/^(?:(?:por favor\s+)?(?:cambi[aá]r?|actualiz[aá]r?|modific[aá]r?|carg[aá]r?|guard[aá]r?|reemplaz[aá]r?|nuevos?|estos son los)\s+(?:los\s+|mis\s+|nuestros\s+)?(?:nuevos\s+)?)?datos\s+(?:bancarios|de\s+la\s+cuenta|para\s+transferir)(?:\s+(?:nuevos|son|del estudio))?\s*(?:[:=\-–]|\s(?=\S))?\s*([\s\S]*)$/i);
+    if (mBanco && !/^\s*(ver|mostrar|cuales son)\b/i.test(limpio)) {
         const datos = mBanco[1].trim();
-        if (!/\b(cbu|cvu|alias)\b/i.test(datos)) return 'Para guardarlos necesito al menos el CBU, el CVU o el alias.';
+        if (!datos || /^\??$/.test(datos)) {
+            if (/^datos/i.test(limpio)) {
+                const g = await leerConfig('datos_bancarios');
+                return g ? `💳 Datos bancarios guardados:\n\n${g}` : 'Todavía no hay datos bancarios cargados. Mandá: *datos bancarios: Banco … · Titular … · CUIT … · CBU … · Alias …*';
+            }
+            return 'Pasame los datos nuevos en el mismo mensaje, por ejemplo:\n*datos bancarios: Banco … · Titular … · CUIT … · CBU … · Alias …*';
+        }
+        if (!REGEX_DATOS_BANCO.test(datos)) return 'Para guardarlos necesito al menos el CBU, el CVU o el alias.';
         await guardarConfig('datos_bancarios', datos);
         return `✅ Guardé estos datos bancarios:\n\n${datos}\n\nAntes de mandárselos a un cliente siempre te pregunto si son estos u otros.`;
     }
-    if (/^\s*(ver\s+)?datos\s+bancarios\s*\??\s*$/i.test(texto)) {
+    if (/^\s*(ver|mostrar|cuales son|cu[aá]les son)\s+(los\s+)?datos\s+bancarios\s*\??\s*$/i.test(limpio)) {
         const datos = await leerConfig('datos_bancarios');
         return datos ? `💳 Datos bancarios guardados:\n\n${datos}` : 'Todavía no hay datos bancarios cargados. Mandá: *datos bancarios: Banco … · Titular … · CUIT … · CBU … · Alias …*';
+    }
+    // "reseñas: https://g.page/r/…/review"
+    const mResena = limpio.match(/^\s*(?:link\s+de\s+)?rese[nñ]as?\s*:\s*(https?:\/\/\S+)/i);
+    if (mResena) {
+        if (!/g\.page|google\.[a-z.]+\/|goo\.gl|maps\.app/i.test(mResena[1])) return 'Ese link no parece de Google. Usá el de "Pedir opiniones" del Perfil de Empresa (https://g.page/r/…/review).';
+        await guardarConfig('resenas_url', mResena[1]);
+        return '✅ Guardé el link de reseñas. Cuando me digas que la sociedad de un cliente quedó inscripta, te pregunto si le pido la reseña.';
+    }
+    // "Pablo inscripta", "la SAS de Pablo quedó inscripta"
+    const nt = normalizarTexto(limpio);
+    const mInsc = nt.match(/^(?:ya\s+)?(?:(?:la\s+)?(?:sas|srl|sa|sociedad)\s+de\s+)?(.+?)\s+(?:ya\s+)?(?:(?:esta|quedo|salio|se)\s+)?(?:inscript[ao]s?|inscribio)$/);
+    if (mInsc && !limpio.includes('?')) {
+        const nombre = mInsc[1].replace(/^(la|el)\s+de\s+/, '').trim();
+        if (nombre && nombre.split(' ').length <= 4 && !/^(quedo|esta|salio|se|ya|la|el|sociedad|sas|srl|sa|ya esta)$/.test(nombre))
+            return (await registrarInscripcion({ cliente: nombre })).mensaje;
     }
     return null;
 }
@@ -3427,6 +3502,10 @@ const HERRAMIENTAS_ADMIN = [
         parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING' } }, required: ['cliente'] }
     },
     {
+        name: 'registrar_inscripcion', description: 'La sociedad del cliente ya quedó inscripta (trámite terminado): lo anota y pregunta si se le pide una reseña en Google.',
+        parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING' } }, required: ['cliente'] }
+    },
+    {
         name: 'detener_seguimiento', description: 'Deja de mandarle los mensajes de seguimiento (días 2, 7 y 15) a una persona que no vino o pidió que la contactemos más adelante.',
         parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono de la persona.' } }, required: ['cliente'] }
     },
@@ -3554,6 +3633,7 @@ async function ejecutarAccionAdmin(nombre, args) {
         case 'armar_presupuesto': return armarPresupuestoAdmin(args);
         case 'retomar_presupuesto': return retomarPresupuesto(args);
         case 'registrar_pago': return registrarPago(args);
+        case 'registrar_inscripcion': return registrarInscripcion(args);
         case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
         case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
         case 'restablecer_dia': return restablecerDia(args.fecha);
@@ -3603,8 +3683,9 @@ async function instruccionesAdmin() {
         'Para una reunión NUEVA de un cliente (otro tema, o una consulta "⚖️ para evaluar" con día y hora) usá agendar_reunion: NUNCA muevas su reunión actual para eso. ' +
         'Para aceptar una consulta "⚖️ para evaluar" sin día ni hora ("decile que sí") usá atender_consulta; para no tomarla, no_atender_consulta. Identificá al cliente por el nombre o el teléfono que figura en el aviso: nunca lo confundas con otro cliente de la conversación.\n' +
         'SEGUIMIENTO (HubSpot): cuando te diga cómo siguió una persona usá resultado_negocio: "asistió" / "no vino" → asistio / no_asistio; "le mandé la propuesta" → propuesta_enviada; "contrató", "cerramos", "pagó" → ganado (además lo marca como cliente); "no siguió", "no le interesa", "lo perdimos" → perdido. Si la reunión tiene número, pasalo en turno_id.\n' +
-        'Para cargar datos el administrador escribe tal cual "datos bancarios: …" o "formulario sas: …" (eso lo guarda el sistema solo).\n' +
-        'PRESUPUESTOS: "cotizale a X una SAS con N socios" → armar_presupuesto; "mandale el presupuesto a X" → retomar_presupuesto; "X pagó" → registrar_pago. El envío del presupuesto lo maneja el sistema con 3 confirmaciones: vos nunca digas que lo enviaste.\n' +
+        'Para cargar o cambiar datos el administrador escribe "datos bancarios: …", "formulario sas: …" o "reseñas: <link>" (eso lo guarda el sistema solo). Si te pide cambiar los datos bancarios sin pasarlos, explicale que mande "datos bancarios: Banco … · Titular … · CBU … · Alias …". Nunca digas que no se pueden cambiar.\n' +
+        'Si te dice que la sociedad de un cliente quedó inscripta ("X inscripta", "salió la SAS de X"), usá registrar_inscripcion: el sistema pregunta si se le pide la reseña en Google.\n' +
+        'PRESUPUESTOS: "cotizale a X una SAS con N socios" → armar_presupuesto; "mandale el presupuesto a X" → retomar_presupuesto; "X pagó" → registrar_pago; "X inscripta" → registrar_inscripcion. El envío del presupuesto lo maneja el sistema con 3 confirmaciones: vos nunca digas que lo enviaste.\n' +
         'Si te dice "no le escribas más a X" (o que no le mandes más seguimientos), usá detener_seguimiento.\n' +
         'Si te pide reiniciar, resetear o borrar a una persona para probar ("que el bot crea que es nuevo"), usá reiniciar_contacto con ESA persona. Nunca reinicies a varias juntas ni a alguien que no nombró.\n' +
         'HORAS: usá solo una hora que haya dicho el administrador o el cliente (por ejemplo "a las 17:15"). Si dicen "después de la otra reunión" o algo sin hora, preguntá a qué hora, indicando a qué hora termina la reunión actual. Nunca elijas una hora por tu cuenta.\n' +
@@ -3649,6 +3730,10 @@ async function procesarMensajeAdmin(sock, sender, text) {
     // 0b) Un cliente pidió los datos bancarios: "sí" envía los guardados, o le pasás otros.
     const rBanco = await respuestaDatosBancarios(text).catch(e => { console.error('Datos bancarios:', e.message); return null; });
     if (rBanco) return responder(rBanco);
+
+    // 0c) Pedido de reseña después de "X inscripta": sí / no.
+    const rResena = await respuestaResena(text).catch(e => { console.error('Reseña:', e.message); return null; });
+    if (rResena) return responder(rResena);
 
     // 1) Respuesta a una acción que quedó esperando confirmación.
     const pendiente = await leerAccionPendiente();
@@ -4543,7 +4628,7 @@ async function estadoSistema() {
         lineas.push(`📅 Google Calendar: ${ok ? `✅ conectado (${await leerConfig('google_cuenta')})` : '❌ el permiso falló, volvé a conectar'}`);
     }
     lineas.push(await estadoHubspot().catch(e => `🧲 HubSpot: ❌ ${e.message}`));
-    lineas.push(`💳 Datos bancarios: ${await leerConfig('datos_bancarios').catch(() => null) ? '✅ cargados' : '⚠️ sin cargar ("datos bancarios: …")'} · 📋 Formulario SAS: ${await leerConfig('formulario_sas_url').catch(() => null) ? '✅ cargado' : '⚠️ sin cargar'}`);
+    lineas.push(`💳 Datos bancarios: ${await leerConfig('datos_bancarios').catch(() => null) ? '✅ cargados' : '⚠️ sin cargar ("datos bancarios: …")'} · 📋 Formulario SAS: ${await leerConfig('formulario_sas_url').catch(() => null) ? '✅ cargado' : '⚠️ sin cargar'} · ⭐ Reseñas: ✅ ${await leerConfig('resenas_url').catch(() => null) ? 'link propio' : 'link del perfil'}`);
     const { rows: [sg] } = await db.query(`SELECT COUNT(*)::int AS n FROM seguimientos WHERE estado = 'activo'`).catch(() => ({ rows: [{ n: 0 }] }));
     lineas.push(`📨 Seguimientos en curso (no vinieron / contactar más adelante): ${sg.n}`);
     const haceMin = ultimaVueltaTareas ? Math.round((Date.now() - ultimaVueltaTareas) / 60000) : null;
@@ -4750,7 +4835,7 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, formularioCompletado, procesarArchivoCliente, comandoConfiguracionAdmin, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, formularioCompletado, procesarArchivoCliente, comandoConfiguracionAdmin, registrarInscripcion, respuestaResena, REGEX_DATOS_BANCO, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
