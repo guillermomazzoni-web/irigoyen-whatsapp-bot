@@ -1927,10 +1927,36 @@ async function registrarInscripcion({ cliente }) {
     if (p?.negocio_id) await actualizarNegocio(p.negocio_id, { etapa: 'Ganado' }, 'Sociedad inscripta').catch(() => {});
     const { rows: [f] } = await db.query('SELECT resena_pedida_en FROM contactos WHERE telefono = $1', [c.telefono]);
     if (f?.resena_pedida_en) return { ok: true, mensaje: `✅ Anoté que la sociedad de ${quien} quedó inscripta. La reseña ya se la pedí el ${formatoFecha(new Date(f.resena_pedida_en))}, así que no se la vuelvo a pedir.` };
-    const { rows: [det] } = await db.query(`SELECT 1 FROM seguimientos WHERE telefono = $1 AND estado = 'detenido' LIMIT 1`, [c.telefono]);
-    if (det) return { ok: true, mensaje: `✅ Anoté que la sociedad de ${quien} quedó inscripta. No le pido reseña porque me dijiste que no le escriba más.` };
+    // Un "no le escribas más" viejo (de los seguimientos) solo cuenta si después no contrató: igual te avisa y pregunta.
+    const { rows: [det] } = await db.query(`SELECT s.creado FROM seguimientos s WHERE s.telefono = $1 AND s.estado = 'detenido'
+        AND NOT EXISTS (SELECT 1 FROM presupuestos p WHERE p.telefono = s.telefono AND p.estado = 'pagado' AND p.actualizado > s.creado)
+        ORDER BY s.creado DESC LIMIT 1`, [c.telefono]).catch(() => ({ rows: [] }));
     await guardarConfig('resena_pendiente', JSON.stringify({ telefono: c.telefono, creada: Date.now() }));
-    return { ok: true, mensaje: `✅ Anoté que la sociedad de ${quien} quedó inscripta (negocio en *Ganado*).\n\n⭐ ¿Le pido una reseña en Google? Respondé *sí* o *no*.` };
+    return { ok: true, mensaje: `✅ Anoté que la sociedad de ${quien} quedó inscripta (negocio en *Ganado*).\n\n` +
+        (det ? `⚠️ Ojo: a esta persona me habías dicho que no le escriba más (seguimientos). ¿Igual le pido una reseña en Google? Respondé *sí* o *no*.`
+            : '⭐ ¿Le pido una reseña en Google? Respondé *sí* o *no*.') };
+}
+
+let resenasEnviadas = 0; // para detectar si el asistente dice que pidió una reseña sin haberlo hecho
+
+async function enviarPedidoResena(telefono) {
+    const link = (await leerConfig('resenas_url')) || RESENAS_URL_INICIAL;
+    await enviarACliente(telefono, textoPedidoResena(link));
+    resenasEnviadas++;
+    await db.query('UPDATE contactos SET resena_pedida_en = NOW() WHERE telefono = $1', [telefono]);
+    const { rows: [p] } = await db.query(`SELECT negocio_id FROM presupuestos WHERE telefono = $1 AND negocio_id IS NOT NULL ORDER BY id DESC LIMIT 1`, [telefono]);
+    if (p?.negocio_id) await actualizarNegocio(p.negocio_id, {}, 'Se le pidió una reseña en Google').catch(() => {});
+}
+
+// "pedile la reseña a X": pedido explícito del administrador (se manda directo, una sola vez por cliente).
+async function pedirResena({ cliente }) {
+    const c = await buscarContacto(cliente);
+    if (c.error) return { ok: false, mensaje: c.error };
+    const { rows: [f] } = await db.query('SELECT resena_pedida_en FROM contactos WHERE telefono = $1', [c.telefono]);
+    if (f?.resena_pedida_en) return { ok: true, mensaje: `A ${etiquetaContacto(c)} ya le pedí la reseña el ${formatoFecha(new Date(f.resena_pedida_en))}. No se la vuelvo a pedir.` };
+    try { await enviarPedidoResena(c.telefono); } catch (e) { return { ok: false, mensaje: `No pude enviarle el mensaje por WhatsApp (${e.message}).` }; }
+    await borrarConfig('resena_pendiente');
+    return { ok: true, mensaje: `⭐ Listo, le pedí la reseña a ${etiquetaContacto(c)}. No se la vuelvo a pedir.` };
 }
 
 async function respuestaResena(texto) {
@@ -1941,18 +1967,14 @@ async function respuestaResena(texto) {
         await borrarConfig('resena_pendiente');
         return 'Listo, no le pido la reseña. 👍';
     }
-    if (!/^(si|sii|ok|dale|pedisela|pedile|si pedisela|si pedile|si dale|enviar|mandale|confirmo)$/.test(t)) return null;
+    if (!/^(si|sii|ok|dale|pedisela|pedile|pediselo|si pedisela|si pedile|si pediselo|si dale|si igual|igual si|pedile igual|si pedile igual|enviar|mandale|mandasela|confirmo)$/.test(t)) return null;
     const c = await obtenerContacto(pend.telefono);
-    const link = (await leerConfig('resenas_url')) || RESENAS_URL_INICIAL;
     try {
-        await enviarACliente(pend.telefono, textoPedidoResena(link));
+        await enviarPedidoResena(pend.telefono);
     } catch (e) {
         return `No pude enviarle el mensaje por WhatsApp (${e.message}). Probá de nuevo respondiendo *sí*.`;
     }
-    await db.query('UPDATE contactos SET resena_pedida_en = NOW() WHERE telefono = $1', [pend.telefono]);
     await borrarConfig('resena_pendiente');
-    const { rows: [p] } = await db.query(`SELECT negocio_id FROM presupuestos WHERE telefono = $1 AND negocio_id IS NOT NULL ORDER BY id DESC LIMIT 1`, [pend.telefono]);
-    if (p?.negocio_id) await actualizarNegocio(p.negocio_id, {}, 'Se le pidió una reseña en Google').catch(() => {});
     return `⭐ Listo, le pedí la reseña a ${etiquetaContacto(c || {}, 'el cliente')}. No se la vuelvo a pedir.`;
 }
 
@@ -2066,6 +2088,9 @@ async function comandoConfiguracionAdmin(texto) {
         await guardarConfig('resenas_url', mResena[1]);
         return '✅ Guardé el link de reseñas. Cuando me digas que la sociedad de un cliente quedó inscripta, te pregunto si le pido la reseña.';
     }
+    // "pedile la reseña a X"
+    const mPedir = normalizarTexto(limpio).match(/^(?:si\s+)?(?:pedile|pedi|pedirle|mandale|enviale|solicitale)\s+(?:la\s+|una\s+)?(?:resena|opinion)(?:\s+en\s+google)?\s+a\s+(.+)$/);
+    if (mPedir) return (await pedirResena({ cliente: mPedir[1] })).mensaje;
     // "Pablo inscripta", "la SAS de Pablo quedó inscripta"
     const nt = normalizarTexto(limpio);
     const mInsc = nt.match(/^(?:ya\s+)?(?:(?:la\s+)?(?:sas|srl|sa|sociedad)\s+de\s+)?(.+?)\s+(?:ya\s+)?(?:(?:esta|quedo|salio|se)\s+)?(?:inscript[ao]s?|inscribio)$/);
@@ -3506,6 +3531,10 @@ const HERRAMIENTAS_ADMIN = [
         parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING' } }, required: ['cliente'] }
     },
     {
+        name: 'pedir_resena', description: 'Le pide al cliente una reseña en Google AHORA (solo si el administrador lo pide explícitamente para esa persona). Es la ÚNICA forma de pedir una reseña.',
+        parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING' } }, required: ['cliente'] }
+    },
+    {
         name: 'detener_seguimiento', description: 'Deja de mandarle los mensajes de seguimiento (días 2, 7 y 15) a una persona que no vino o pidió que la contactemos más adelante.',
         parameters: { type: 'OBJECT', properties: { cliente: { type: 'STRING', description: 'Nombre o teléfono de la persona.' } }, required: ['cliente'] }
     },
@@ -3634,6 +3663,7 @@ async function ejecutarAccionAdmin(nombre, args) {
         case 'retomar_presupuesto': return retomarPresupuesto(args);
         case 'registrar_pago': return registrarPago(args);
         case 'registrar_inscripcion': return registrarInscripcion(args);
+        case 'pedir_resena': return pedirResena(args);
         case 'bloquear_horario': return agregarExcepcion('bloquear', args.fecha, args.desde, args.hasta);
         case 'abrir_horario': return agregarExcepcion('abrir', args.fecha, args.desde, args.hasta);
         case 'restablecer_dia': return restablecerDia(args.fecha);
@@ -3684,7 +3714,7 @@ async function instruccionesAdmin() {
         'Para aceptar una consulta "⚖️ para evaluar" sin día ni hora ("decile que sí") usá atender_consulta; para no tomarla, no_atender_consulta. Identificá al cliente por el nombre o el teléfono que figura en el aviso: nunca lo confundas con otro cliente de la conversación.\n' +
         'SEGUIMIENTO (HubSpot): cuando te diga cómo siguió una persona usá resultado_negocio: "asistió" / "no vino" → asistio / no_asistio; "le mandé la propuesta" → propuesta_enviada; "contrató", "cerramos", "pagó" → ganado (además lo marca como cliente); "no siguió", "no le interesa", "lo perdimos" → perdido. Si la reunión tiene número, pasalo en turno_id.\n' +
         'Para cargar o cambiar datos el administrador escribe "datos bancarios: …", "formulario sas: …" o "reseñas: <link>" (eso lo guarda el sistema solo). Si te pide cambiar los datos bancarios sin pasarlos, explicale que mande "datos bancarios: Banco … · Titular … · CBU … · Alias …". Nunca digas que no se pueden cambiar.\n' +
-        'Si te dice que la sociedad de un cliente quedó inscripta ("X inscripta", "salió la SAS de X"), usá registrar_inscripcion: el sistema pregunta si se le pide la reseña en Google.\n' +
+        'Si te dice que la sociedad de un cliente quedó inscripta ("X inscripta", "salió la SAS de X"), usá registrar_inscripcion: el sistema pregunta si se le pide la reseña en Google. Para pedir una reseña usá SOLO pedir_resena; nunca digas que pediste o enviaste una reseña si la herramienta no lo confirmó.\n' +
         'PRESUPUESTOS: "cotizale a X una SAS con N socios" → armar_presupuesto; "mandale el presupuesto a X" → retomar_presupuesto; "X pagó" → registrar_pago; "X inscripta" → registrar_inscripcion. El envío del presupuesto lo maneja el sistema con 3 confirmaciones: vos nunca digas que lo enviaste.\n' +
         'Si te dice "no le escribas más a X" (o que no le mandes más seguimientos), usá detener_seguimiento.\n' +
         'Si te pide reiniciar, resetear o borrar a una persona para probar ("que el bot crea que es nuevo"), usá reiniciar_contacto con ESA persona. Nunca reinicies a varias juntas ni a alguien que no nombró.\n' +
@@ -3772,6 +3802,7 @@ async function procesarMensajeAdmin(sock, sender, text) {
     }
 
     // 3) Conversación con el asistente.
+    const resenasAntes = resenasEnviadas;
     if (Date.now() - ultimoMensajeAdmin > 2 * 60 * 60 * 1000) historialAdmin = [];
     ultimoMensajeAdmin = Date.now();
     const mensajeUsuario = { role: 'user', parts: [{ text }] };
@@ -3813,9 +3844,13 @@ async function procesarMensajeAdmin(sock, sender, text) {
         }
     });
 
-    const texto = respuesta || 'Perdón, no pude procesar eso ahora (Gemini no respondió). Probá de nuevo en un minuto o usá un comando, por ejemplo "ADMIN AGENDA".';
+    let texto = respuesta || 'Perdón, no pude procesar eso ahora (Gemini no respondió). Probá de nuevo en un minuto o usá un comando, por ejemplo "ADMIN AGENDA".';
+    // El asistente no puede decir que pidió una reseña si no se envió ninguna en este mensaje.
+    if (respuesta && resenasEnviadas === resenasAntes && /rese[ñn]a/i.test(respuesta) && /\b(ped[ií]|le ped[ií]|envi[ée]|mand[ée]|solicit[ée]|qued[óo] (pedid|enviad))/i.test(respuesta) && !/\bno le (ped[ií]|envi[ée]|mand[ée])/i.test(respuesta)) {
+        texto = '⚠️ No le pedí ninguna reseña todavía. Para pedírsela escribí: *pedile la reseña a <nombre>*.';
+    }
     await sock.sendMessage(sender, { text: texto });
-    if (respuesta) recordarEnHistorialAdmin(text, respuesta);
+    if (respuesta) recordarEnHistorialAdmin(text, texto);
 }
 // ==================== 12. Tareas programadas ====================
 
@@ -4835,7 +4870,7 @@ module.exports = {
     franjasDelDia, elegirOpciones, horariosLibres, cargarFeriados, nombreFeriado, fechaPascua, feriadosCalculados,
     resumenDisponibilidad, resumenAgenda, avisarTurnosEnFeriados,
     // turnos
-    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, formularioCompletado, procesarArchivoCliente, comandoConfiguracionAdmin, registrarInscripcion, respuestaResena, REGEX_DATOS_BANCO, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
+    obtenerTurno, turnosActivosCliente, reiniciarContacto, propositoDirecto, propositoDeTexto, extraerTema, leerConfig, sincronizarHubspot, informeHubspot, formularioCompletado, procesarArchivoCliente, comandoConfiguracionAdmin, registrarInscripcion, respuestaResena, pedirResena, REGEX_DATOS_BANCO, calcularPresupuesto, respuestaPresupuesto, registrarPago, obtenerDolarOficial, textoPresupuestoCliente, informeSemanal, revisarInformeSemanal, lunesDe, abrirNegocio, actualizarNegocio, revisarSeguimientos, iniciarSeguimiento, procesarRespuestaAsistencia, guardarMensaje, proximoMomentoHabil, textoSeguimiento, formatoFecha, revisarHubspot, enviarACliente, enviarAAdmin, procesarComandoAdmin, estadoSistema, registrarResultado, reunionesSinResultado, estadoHubspot, asistenciaDelAdmin, leerCambio, confirmarTurno, rechazarTurno, proponerHorario, moverReunion, descartarCambio, cancelarTurno, cambiarDuracion,
     // bots
     ejecutarHerramientaCliente, consultarGemini, construirInstrucciones, textoRecordatorioCliente, registrarMensajeCliente,
     procesarMensajeAdmin, instruccionesAdmin, reenviarRespuestaAlAdmin, conversarConHerramientas, esTextoInterno, revisarTareas,
